@@ -1,6 +1,8 @@
 package standalone_storage
 
 import (
+	"errors"
+
 	"github.com/Connor1996/badger"
 	"github.com/pingcap-incubator/tinykv/kv/config"
 	"github.com/pingcap-incubator/tinykv/kv/storage"
@@ -45,7 +47,9 @@ func (s *StandAloneStorage) Stop() error {
 }
 
 func (s *StandAloneStorage) Reader(ctx *kvrpcpb.Context) (storage.StorageReader, error) {
-	return &StandAloneStorageReader{s, s.db.NewTransaction(false), []*engine_util.BadgerIterator{}}, nil
+	reader := StandAloneStorageReader{s, s.db.NewTransaction(false), []*engine_util.BadgerIterator{}}
+	s.readers = append(s.readers, &reader)
+	return &reader, nil
 }
 
 func (s *StandAloneStorage) Write(ctx *kvrpcpb.Context, batch []storage.Modify) error {
@@ -55,6 +59,8 @@ func (s *StandAloneStorage) Write(ctx *kvrpcpb.Context, batch []storage.Modify) 
 			return engine_util.PutCF(s.db, data.Cf, data.Key, data.Value)
 		case storage.Delete:
 			return engine_util.DeleteCF(s.db, data.Cf, data.Key)
+		default:
+			return errors.New("unknown type of write")
 		}
 	}
 	return nil
@@ -67,7 +73,7 @@ func (r *StandAloneStorageReader) GetCF(cf string, key []byte) ([]byte, error) {
 
 func (r *StandAloneStorageReader) IterCF(cf string) engine_util.DBIterator {
 	if r.txn == nil {
-		panic("reader shouldn't have a nil iter")
+		panic("IterCF: reader should have a txn")
 	}
 
 	iter := engine_util.NewCFIterator(cf, r.txn)
