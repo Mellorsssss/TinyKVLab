@@ -127,3 +127,20 @@ func IsResponseMsg(msgt pb.MessageType) bool {
 func isHardStateEqual(a, b pb.HardState) bool {
 	return a.Term == b.Term && a.Vote == b.Vote && a.Commit == b.Commit
 }
+
+func makePrs(peers []uint64) map[uint64]*Progress {
+	prs := make(map[uint64]*Progress)
+	for _, id := range peers {
+		prs[id] = &Progress{}
+	}
+	return prs
+}
+
+func makeVotes(peers []uint64) map[uint64]bool {
+	votes := make(map[uint64]bool)
+	for _, id := range peers {
+		votes[id] = false
+	}
+
+	return votes
+}
