@@ -17,6 +17,7 @@ package raft
 import (
 	"errors"
 	"math/rand"
+	"sort"
 
 	"github.com/pingcap-incubator/tinykv/log"
 
@@ -195,7 +196,36 @@ func newRaft(c *Config) *Raft {
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
-	return false
+
+	logTerm, err := r.RaftLog.Term(r.Prs[to].Next - 1)
+	if err != nil { // log not found
+		panic("prev log should exsits")
+	}
+
+	log.Infof("%v send to %v, prevIndex: %v, pervTerm: %v", r.id, to, r.Prs[to].Next-1, logTerm)
+
+	logOffset := r.Prs[to].Next - r.RaftLog.entries[0].Index
+
+	ents := []*pb.Entry{}
+	if int(logOffset) < len(r.RaftLog.entries) {
+		for _, ent := range r.RaftLog.entries[logOffset:] {
+			nent := ent
+			ents = append(ents, &nent)
+		}
+	}
+
+	r.msgs = append(r.msgs, pb.Message{
+		MsgType: pb.MessageType_MsgAppend,
+		Term:    r.Term,
+		From:    r.id,
+		To:      to,
+		Index:   r.Prs[to].Next - 1,
+		LogTerm: logTerm,
+		Entries: ents,
+		Commit:  r.RaftLog.committed,
+	})
+
+	return true
 }
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
@@ -216,6 +246,21 @@ func (r *Raft) bcastHeartbeat() {
 	for peer := range r.Prs {
 		if peer != r.id {
 			r.sendHeartbeat(peer)
+		}
+	}
+}
+
+func (r *Raft) bcastAppend() {
+	if r.State != StateLeader {
+		log.Infof("%v is not leader but try to send append", r.id)
+		return
+	}
+
+	for peer := range r.Prs {
+		if peer != r.id {
+			log.Infof("%v sends to %v", r.id, peer)
+			succ := r.sendAppend(peer)
+			assert(succ, "sendAppend should succ")
 		}
 	}
 }
@@ -298,7 +343,7 @@ func (r *Raft) becomeLeader() {
 	}
 
 	// todo: send a nop entry on its term
-	r.Step(pb.Message{MsgType: pb.MessageType_MsgBeat})
+	r.Step(pb.Message{MsgType: pb.MessageType_MsgPropose, Entries: []*pb.Entry{{Data: nil}}}) // noop entry
 }
 
 func (r *Raft) stepFollower(m pb.Message) error {
@@ -319,6 +364,11 @@ func (r *Raft) stepFollower(m pb.Message) error {
 				}
 			}
 		}
+	case pb.MessageType_MsgPropose:
+		// forwarded to leader
+		log.Infof("%v recv propose, forward it to %v", r.id, r.Lead)
+		m.To = r.Lead // is this legal?
+		r.msgs = append(r.msgs, m)
 	case pb.MessageType_MsgRequestVote:
 		fallthrough
 	case pb.MessageType_MsgRequestVoteResponse:
@@ -338,8 +388,6 @@ func (r *Raft) stepFollower(m pb.Message) error {
 
 func (r *Raft) stepCandidate(m pb.Message) error {
 	switch m.MsgType {
-	case pb.MessageType_MsgBeat:
-		return nil // ignore
 	case pb.MessageType_MsgHup: // start new election
 		r.becomeCandidate()
 		log.Infof("%v get msg hup and begin a new election", r.id)
@@ -353,6 +401,10 @@ func (r *Raft) stepCandidate(m pb.Message) error {
 				}
 			}
 		}
+	case pb.MessageType_MsgBeat:
+		return nil // ignore
+	case pb.MessageType_MsgPropose:
+		return nil // ignore
 	case pb.MessageType_MsgRequestVote:
 		fallthrough
 	case pb.MessageType_MsgRequestVoteResponse:
@@ -376,6 +428,8 @@ func (r *Raft) stepLeader(m pb.Message) error {
 		return nil // just ignore
 	case pb.MessageType_MsgBeat:
 		r.bcastHeartbeat()
+	case pb.MessageType_MsgPropose:
+		r.handlePropose(m)
 	case pb.MessageType_MsgRequestVote:
 		fallthrough
 	case pb.MessageType_MsgRequestVoteResponse:
@@ -388,8 +442,6 @@ func (r *Raft) stepLeader(m pb.Message) error {
 		fallthrough
 	case pb.MessageType_MsgHeartbeatResponse:
 		r.handleHeartbeat(m)
-	case pb.MessageType_MsgPropose:
-		log.Info("todo: handle propose")
 	default:
 		log.Fatalf("leader %v get unknown msg", r.id)
 	}
@@ -490,31 +542,99 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 			return
 		}
 
-		if r.Term <= m.Term { // special for AE
-			r.becomeFollower(m.Term, m.From)
-		}
+		r.becomeFollower(m.Term, m.From)
 
-		term, _ := r.RaftLog.Term(m.Index)
-		if term == 0 { // no log at m.Index
+		term, err := r.RaftLog.Term(m.Index)
+		if err != nil || term != m.LogTerm { // no log found with m.Index in local logs or mismatch
 			r.msgs = append(r.msgs, pb.Message{MsgType: pb.MessageType_MsgAppendResponse, From: r.id, To: m.From, Term: r.Term, Reject: true})
 			return
 		}
 
-		// update committed
-		if m.Commit > r.RaftLog.committed {
-			r.RaftLog.committed = max(r.RaftLog.committed, min(m.Commit, m.Index))
+		// check log consistency and apply new logs
+		if m.Entries != nil && len(m.Entries) > 0 {
+			loglen := len(r.RaftLog.entries)
+			var logoffset int // the begin index of local logs
+			if loglen == 0 {
+				logoffset = 0
+			} else {
+				logoffset = int(m.Entries[0].Index) - int(r.RaftLog.entries[0].Index)
+				log.Infof("the logoffset is %v", logoffset)
+
+				assert(logoffset == loglen || r.RaftLog.entries[logoffset].Index == m.Entries[0].Index, "begin index should be the same")
+			}
+
+			if logoffset > loglen || logoffset < 0 {
+				panic("offset should no larger than loglen and le than 0")
+			}
+
+			for ind, ent := range m.Entries {
+				if logoffset == loglen { // reach the end of local logs, just append
+					log.Infof("%v just append the logs", r.id)
+
+					// assert(r.RaftLog.stabled == uint64(logoffset), "all the previous logs are persisted")
+					for _, ent := range m.Entries[ind:] {
+						r.RaftLog.entries = append(r.RaftLog.entries, *ent)
+					}
+					break
+				}
+
+				// todo: remove the check
+				if r.RaftLog.entries[logoffset].Index != ent.Index {
+					panic("index should equal")
+				}
+
+				term := r.RaftLog.entries[logoffset].Term // check term equality
+				if term != ent.Term {                     // drop following local logs and just append
+					offset := ent.Index - r.RaftLog.entries[0].Index
+					r.RaftLog.entries = append([]pb.Entry{}, r.RaftLog.entries[:offset]...)
+
+					r.RaftLog.stabled = r.RaftLog.LastIndex()
+
+					log.Infof("%v trunc logs from %v", r.id, offset)
+
+					for _, ent := range m.Entries[ind:] {
+						r.RaftLog.entries = append(r.RaftLog.entries, *ent)
+					}
+					break
+				}
+
+				logoffset++
+			}
 		}
 
-		r.msgs = append(r.msgs, pb.Message{MsgType: pb.MessageType_MsgAppendResponse, From: r.id, To: m.From, Term: r.Term, Reject: false})
+		// local logs: [1, 2, 3, 4, 5]
+		// incoming logs: [3, 4, 5] / [3, 4] / [4, 5, 6]
+
+		// update commit index
+		lastNewIndex := m.Index
+		if m.Entries != nil && len(m.Entries) > 0 {
+			lastNewIndex = m.Entries[len(m.Entries)-1].Index
+		}
+
+		if m.Commit > r.RaftLog.committed {
+			r.RaftLog.committed = max(r.RaftLog.committed, min(m.Commit, lastNewIndex))
+		}
+
+		r.msgs = append(r.msgs, pb.Message{
+			MsgType: pb.MessageType_MsgAppendResponse,
+			From:    r.id,
+			To:      m.From,
+			Term:    r.Term,
+			Reject:  false,
+			Index:   lastNewIndex})
 
 	case pb.MessageType_MsgAppendResponse:
-		log.Infof("[%v, %v] get append response from [%v, %v]", r.id, r.Term, m.From, m.Term)
 		// maintain the Prs
 		if m.Reject {
+			log.Infof("[%v, %v] get append reject response from [%v, %v]", r.id, r.Term, m.From, m.Term)
 			r.Prs[m.From].Next--
+
+			r.sendAppend(m.From)
 		} else {
-			r.Prs[m.From].Match = max(r.Prs[m.From].Match, r.Prs[m.From].Next)
-			r.Prs[m.From].Next++
+			r.Prs[m.From].Match = max(r.Prs[m.From].Match, m.Index)
+			r.Prs[m.From].Next = max(r.Prs[m.From].Next, m.Index+1)
+			log.Infof("[%v, %v] get append ok response from [%v, %v], Next: %v, Match: %v now", r.id, r.Term, m.From, m.Term, r.Prs[m.From].Next, r.Prs[m.From].Match)
+			r.tryUpdateCommit()
 		}
 	default:
 		panic("handleAppendEntries: get wrong message")
@@ -555,13 +675,25 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 		if m.Reject {
 			r.Prs[m.From].Next--
 		} else {
-			r.Prs[m.From].Match = max(r.Prs[m.From].Match, r.Prs[m.From].Next)
-			r.Prs[m.From].Next++
+			r.Prs[m.From].Match = max(r.Prs[m.From].Match, m.Index)
 		}
 	default:
 
 		panic("handleHeartbeat: get wrong message")
 	}
+}
+
+func (r *Raft) handlePropose(m pb.Message) {
+	assert(r.State == StateLeader, "only leader could get propose")
+
+	// 1. append logs to local logs
+	if m.Entries != nil && len(m.Entries) > 0 {
+		log.Infof("%v begins to append entries", r.id)
+		r.appendEntry(m.Entries)
+	}
+
+	// 2. broadcast to all peers
+	r.bcastAppend()
 }
 
 // handleSnapshot handle Snapshot RPC request
@@ -577,4 +709,62 @@ func (r *Raft) addNode(id uint64) {
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+}
+
+func (r *Raft) appendEntry(ents []*pb.Entry) {
+	lastIndex := r.RaftLog.LastIndex()
+	log.Infof("%v append %v to logs, lastIndex: %v", r.id, ents, lastIndex)
+	log.Infof("last index: %v and stabled: %v", lastIndex, r.RaftLog.stabled)
+	// assert(r.RaftLog.stabled == lastIndex, "logs before append should be persisted")
+	for _, ent := range ents {
+		lastIndex++
+		nent := *ent
+		nent.Term = r.Term
+		nent.Index = lastIndex
+		if ent.Data != nil {
+			copy(nent.Data, ent.Data)
+		}
+		r.RaftLog.entries = append(r.RaftLog.entries, nent)
+	}
+
+	if len(r.Prs) == 1 { // corner case: single node, just commit
+		r.RaftLog.committed = lastIndex
+	}
+}
+
+// tryUpdateCommit is called only when peer's Match is updated
+// according to last rule of leader
+func (r *Raft) tryUpdateCommit() bool {
+	// todo: single node?
+	th := len(r.Prs) / 2 // at least th peers should persist the log
+
+	matchs := []uint64{}
+	for id, pr := range r.Prs {
+		if id == r.id {
+			continue
+		}
+
+		matchs = append(matchs, pr.Match)
+	}
+
+	sort.Slice(matchs, func(i, j int) bool { return matchs[i] > matchs[j] })
+	log.Infof("after sort: %v", matchs)
+
+	if matchs[th-1] > r.RaftLog.committed {
+		term, err := r.RaftLog.Term(matchs[th-1])
+		assert(err == nil, "tryUpdateCommit: term must exist")
+
+		if term != r.Term {
+			return false
+		}
+		r.RaftLog.committed = matchs[th-1]
+		log.Infof("%v update commit to %v", r.id, r.RaftLog.committed)
+
+		// when advance commit index, broad cast append entries
+		// todo: when?
+		r.bcastAppend()
+		return true
+	}
+
+	return false
 }

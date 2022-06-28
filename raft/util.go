@@ -144,3 +144,9 @@ func makeVotes(peers []uint64) map[uint64]bool {
 
 	return votes
 }
+
+func assert(stat bool, prompt string) {
+	if !stat {
+		panic(prompt)
+	}
+}

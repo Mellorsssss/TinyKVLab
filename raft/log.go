@@ -73,7 +73,7 @@ func newLog(storage Storage) *RaftLog {
 		storage:         storage,
 		committed:       hardState.Commit,
 		applied:         0,
-		stabled:         hardState.Commit, // todo: is this wrong?
+		stabled:         hi, // todo: is this wrong?
 		entries:         ents,
 		pendingSnapshot: &snapshot,
 	}
