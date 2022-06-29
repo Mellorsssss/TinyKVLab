@@ -127,7 +127,8 @@ type Raft struct {
 	State StateType
 
 	// votes records
-	votes map[uint64]bool
+	votes    map[uint64]bool
+	hasVoted map[uint64]bool
 
 	// msgs need to send
 	msgs []pb.Message
@@ -180,6 +181,7 @@ func newRaft(c *Config) *Raft {
 		Prs:                 makePrs(c.peers),
 		State:               StateFollower,
 		votes:               makeVotes(c.peers),
+		hasVoted:            makeVotes(c.peers),
 		msgs:                []pb.Message{},
 		Lead:                0,
 		heartbeatTimeout:    c.HeartbeatTick,
@@ -321,9 +323,12 @@ func (r *Raft) becomeCandidate() {
 	// clear the vote status
 	for id := range r.votes {
 		r.votes[id] = false
+		r.hasVoted[id] = false
 	}
 
-	r.votes[r.id] = true // vote for self
+	// vote for self
+	r.votes[r.id] = true
+	r.hasVoted[r.id] = true
 }
 
 // becomeLeader transform this peer's state to leader
@@ -511,6 +516,13 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 			return
 		}
 
+		if r.hasVoted[m.From] { // reduant replies
+			log.Infof("%v get redudant grant from %v", r.id, m.From)
+			return
+		}
+
+		r.hasVoted[m.From] = true
+
 		if !m.Reject { // vote granted
 			log.Infof("%v get grant from %v", r.id, m.From)
 			r.votes[m.From] = true
@@ -529,6 +541,18 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 		} else {
 			if m.Term > r.Term {
 				r.becomeFollower(m.Term, 0)
+			}
+
+			minVotes := (len(r.votes))/2 + 1 // at least minVotes to become follower
+			voteCnt := 0
+			for id, granted := range r.votes {
+				if !granted && r.hasVoted[id] {
+					voteCnt++
+				}
+			}
+
+			if voteCnt >= minVotes {
+				r.becomeFollower(r.Term, 0)
 			}
 		}
 	default:
