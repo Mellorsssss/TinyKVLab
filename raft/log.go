@@ -17,6 +17,7 @@ package raft
 import (
 	"errors"
 
+	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -97,6 +98,7 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 
 		ents = append(ents, ent)
 	}
+	log.Infof("stable: %v, ents: %v", l.stabled, ents)
 	return ents
 }
 
@@ -122,6 +124,7 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 		ents = append(ents, ent)
 	}
 
+	log.Infof("next ents: %v", ents)
 	return ents
 }
 
