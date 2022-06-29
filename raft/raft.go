@@ -199,6 +199,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 
 	logTerm, err := r.RaftLog.Term(r.Prs[to].Next - 1)
 	if err != nil { // log not found
+		log.Infof("%v fail to find prev log with %v", r.id, r.Prs[to].Next)
 		panic("prev log should exsits")
 	}
 
@@ -342,7 +343,9 @@ func (r *Raft) becomeLeader() {
 		r.Prs[id].Match = 0
 	}
 
-	// todo: send a nop entry on its term
+	// specifically, leader's progress info is newst
+	r.Prs[r.id].Match = lastLogIndex
+
 	r.Step(pb.Message{MsgType: pb.MessageType_MsgPropose, Entries: []*pb.Entry{{Data: nil}}}) // noop entry
 }
 
@@ -379,6 +382,8 @@ func (r *Raft) stepFollower(m pb.Message) error {
 		return nil // ignore
 	case pb.MessageType_MsgAppend:
 		r.handleAppendEntries(m)
+	case pb.MessageType_MsgAppendResponse:
+		return nil // ignore this
 	default:
 		log.Fatalf("%v get unknown msg %v", r.id, m)
 	}
@@ -627,7 +632,10 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		// maintain the Prs
 		if m.Reject {
 			log.Infof("[%v, %v] get append reject response from [%v, %v]", r.id, r.Term, m.From, m.Term)
-			r.Prs[m.From].Next--
+			// todo: snapshot support
+			if r.Prs[m.From].Next != 1 {
+				r.Prs[m.From].Next--
+			}
 
 			r.sendAppend(m.From)
 		} else {
@@ -673,9 +681,18 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 		log.Infof("[%v, %v] get heartbeat response from [%v, %v]", r.id, r.Term, m.From, m.Term)
 		// maintain the Prs
 		if m.Reject {
-			r.Prs[m.From].Next--
+			// todo: snapshot support
+			log.Infof("%v get heart beat rej from %v", r.id, m.From)
+			if r.Prs[m.From].Next != 1 {
+				r.Prs[m.From].Next--
+			}
+
 		} else {
 			r.Prs[m.From].Match = max(r.Prs[m.From].Match, m.Index)
+		}
+
+		if r.Prs[m.From].Next <= r.RaftLog.LastIndex() {
+			r.sendAppend(m.From)
 		}
 	default:
 
@@ -714,13 +731,14 @@ func (r *Raft) removeNode(id uint64) {
 func (r *Raft) appendEntry(ents []*pb.Entry) {
 	lastIndex := r.RaftLog.LastIndex()
 	log.Infof("%v append %v to logs, lastIndex: %v", r.id, ents, lastIndex)
-	log.Infof("last index: %v and stabled: %v", lastIndex, r.RaftLog.stabled)
+
 	// assert(r.RaftLog.stabled == lastIndex, "logs before append should be persisted")
 	for _, ent := range ents {
 		lastIndex++
 		nent := *ent
 		nent.Term = r.Term
 		nent.Index = lastIndex
+		// todo: is this copy neccassary ?
 		if ent.Data != nil {
 			copy(nent.Data, ent.Data)
 		}
@@ -730,20 +748,19 @@ func (r *Raft) appendEntry(ents []*pb.Entry) {
 	if len(r.Prs) == 1 { // corner case: single node, just commit
 		r.RaftLog.committed = lastIndex
 	}
+
+	r.Prs[r.id].Match = lastIndex
+	r.Prs[r.id].Next = lastIndex + 1
 }
 
 // tryUpdateCommit is called only when peer's Match is updated
 // according to last rule of leader
 func (r *Raft) tryUpdateCommit() bool {
 	// todo: single node?
-	th := len(r.Prs) / 2 // at least th peers should persist the log
+	th := len(r.Prs)/2 + 1 // at least th peers should persist the log
 
 	matchs := []uint64{}
-	for id, pr := range r.Prs {
-		if id == r.id {
-			continue
-		}
-
+	for _, pr := range r.Prs {
 		matchs = append(matchs, pr.Match)
 	}
 
