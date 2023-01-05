@@ -66,6 +66,7 @@ func newLog(storage Storage) *RaftLog {
 	}
 
 	hardState, _, _ := storage.InitialState()
+	// corner case: filter the dummy logs
 	lo, _ := storage.FirstIndex()
 	hi, _ := storage.LastIndex()
 	ents, _ := storage.Entries(lo, hi+1)
@@ -73,8 +74,8 @@ func newLog(storage Storage) *RaftLog {
 	return &RaftLog{
 		storage:         storage,
 		committed:       hardState.Commit,
-		applied:         0,
-		stabled:         hi, // todo: is this wrong?
+		applied:         lo - 1, // apply from the first possible log
+		stabled:         hi,     // todo: is this wrong?
 		entries:         ents,
 		pendingSnapshot: &snapshot,
 	}
@@ -92,20 +93,35 @@ func (l *RaftLog) maybeCompact() {
 // note, this is one of the test stub functions you need to implement.
 func (l *RaftLog) allEntries() []pb.Entry {
 	// Your Code Here (2A).
-	return nil
+	ents := []pb.Entry{}
+
+	// filter all the dummy entries
+	for offset, ent := range l.entries {
+		if ent.Term == 0 {
+			continue
+		}
+		ents = append(ents, l.entries[offset:]...)
+		break
+	}
+
+	return ents
 }
 
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
 	ents := []pb.Entry{}
-	for _, ent := range l.entries {
-		if ent.Index <= l.stabled { // skip stable entries
-			continue
-		}
 
-		ents = append(ents, ent)
+	if len(l.entries) == 0 {
+		return ents
 	}
+
+	offset := l.stabled - l.entries[0].Index + 1
+	if offset >= uint64(len(l.entries)) {
+		return ents
+	}
+
+	ents = append(ents, l.entries[offset:]...)
 	log.Infof("stable: %v, ents: %v", l.stabled, ents)
 	return ents
 }
@@ -121,16 +137,12 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 		panic("applied should be less than committed")
 	}
 
-	for _, ent := range l.entries {
-		if ent.Index <= l.applied {
-			continue
-		}
+	// invariant: len(l.entries) > 0
+	assert(len(l.entries) > 0, "should have at least one entry")
+	appliedOffset := l.applied - l.entries[0].Index
+	committedOffset := l.committed - l.entries[0].Index
 
-		if ent.Index > l.committed {
-			break
-		}
-		ents = append(ents, ent)
-	}
+	ents = append(ents, l.entries[appliedOffset+1:committedOffset+1]...)
 
 	log.Infof("next ents: %v", ents)
 	return ents
@@ -152,14 +164,16 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
 	// todo: add support for snapshot
 
-	if i == 0 { // corner case, no logs at beginning
+	// when acquire the non-existed log, return term 0
+	if i == 0 {
 		return 0, nil
 	}
 
-	for _, ent := range l.entries {
-		if ent.Index == i {
-			return ent.Term, nil
-		}
+	if len(l.entries) == 0 || i < l.entries[0].Index || i > l.LastIndex() {
+		return 0, errors.New("fail to find matching index in log")
 	}
-	return 0, errors.New("no logs match index")
+
+	offset := i - l.entries[0].Index
+	// jump to the position of index i
+	return l.entries[offset].Term, nil
 }
