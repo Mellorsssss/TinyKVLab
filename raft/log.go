@@ -177,3 +177,14 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// jump to the position of index i
 	return l.entries[offset].Term, nil
 }
+
+// LastIndex return the last index of the log entries
+func (l *RaftLog) FirstIndex() uint64 {
+	// Your Code Here (2A).
+	// todo: add support for snapshot
+	if len(l.entries) == 0 { // no entries, just return 0
+		return 1
+	}
+
+	return l.entries[0].Index
+}

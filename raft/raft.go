@@ -183,7 +183,7 @@ func newRaft(c *Config) *Raft {
 		votes:               makeVotes(c.peers),
 		hasVoted:            makeVotes(c.peers),
 		msgs:                []pb.Message{},
-		Lead:                0,
+		Lead:                0, // 0 is invalid for Lead
 		heartbeatTimeout:    c.HeartbeatTick,
 		electionTimeout:     c.ElectionTick,
 		electionRandTimeout: c.ElectionTick,
@@ -516,7 +516,7 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 			return
 		}
 
-		if r.hasVoted[m.From] { // reduant replies
+		if m.Term != r.Term || r.hasVoted[m.From] { // reduant replies
 			log.Infof("%v get redudant grant from %v", r.id, m.From)
 			return
 		}
@@ -571,7 +571,9 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 			return
 		}
 
-		r.becomeFollower(m.Term, m.From)
+		if m.Term > r.Term || r.Lead != m.From { // optimize: if the peer is follower in the term, there couldn't be another leader
+			r.becomeFollower(m.Term, m.From)
+		}
 
 		term, err := r.RaftLog.Term(m.Index)
 		if err != nil || term != m.LogTerm { // no log found with m.Index in local logs or mismatch
@@ -657,7 +659,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		if m.Reject {
 			log.Infof("[%v, %v] get append reject response from [%v, %v]", r.id, r.Term, m.From, m.Term)
 			// todo: snapshot support
-			if r.Prs[m.From].Next != 1 {
+			if r.Prs[m.From].Next != r.RaftLog.FirstIndex() {
 				r.Prs[m.From].Next--
 			}
 
@@ -684,7 +686,7 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 			return
 		}
 
-		if r.Term <= m.Term {
+		if m.Term > r.Term || r.Lead != m.From { // optimize: if the peer is follower in the term, there couldn't be another leader
 			r.becomeFollower(m.Term, m.From)
 		}
 
@@ -699,7 +701,8 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 			r.RaftLog.committed = max(r.RaftLog.committed, min(m.Commit, m.Index))
 		}
 
-		r.msgs = append(r.msgs, pb.Message{MsgType: pb.MessageType_MsgHeartbeatResponse, From: r.id, To: m.From, Term: r.Term, Reject: false})
+		// return the last matching index too
+		r.msgs = append(r.msgs, pb.Message{MsgType: pb.MessageType_MsgHeartbeatResponse, From: r.id, To: m.From, Term: r.Term, Index: m.Index, Reject: false})
 
 	case pb.MessageType_MsgHeartbeatResponse:
 		log.Infof("[%v, %v] get heartbeat response from [%v, %v]", r.id, r.Term, m.From, m.Term)
@@ -707,10 +710,12 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 		if m.Reject {
 			// todo: snapshot support
 			log.Infof("%v get heart beat rej from %v", r.id, m.From)
-			if r.Prs[m.From].Next != 1 {
+
+			if m.Term > r.Term { // degrade to Follower
+				r.becomeFollower(m.From, m.Term)
+			} else if r.Prs[m.From].Next != r.RaftLog.FirstIndex() { // update the Next
 				r.Prs[m.From].Next--
 			}
-
 		} else {
 			r.Prs[m.From].Match = max(r.Prs[m.From].Match, m.Index)
 		}
