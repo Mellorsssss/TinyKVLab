@@ -4,12 +4,15 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Connor1996/badger"
 	"github.com/Connor1996/badger/y"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/message"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/runner"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/snap"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
+	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	"github.com/pingcap-incubator/tinykv/log"
+	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/raft_cmdpb"
 	rspb "github.com/pingcap-incubator/tinykv/proto/pkg/raft_serverpb"
@@ -43,6 +46,87 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		return
 	}
 	// Your Code Here (2B).
+	if d.peer.RaftGroup.HasReady() {
+		ready := d.peer.RaftGroup.Ready()
+		// todo: handle the apply result
+		if _, err := d.peer.peerStorage.SaveReadyState(&ready); err != nil {
+			panic("fail to save ready state")
+		}
+
+		// send all the outbound messages
+		d.Send(d.ctx.trans, ready.Messages)
+
+		for _, entry := range ready.CommittedEntries {
+			switch entry.EntryType {
+			case eraftpb.EntryType_EntryNormal:
+				req := new(raft_cmdpb.Request)
+				if err := req.Unmarshal(entry.Data); err != nil {
+					panic("fail to unmarshal the cmdEntry")
+				}
+
+				proposal, err := d.GetProposeCallback(entry.Index, entry.Term)
+				if err != nil {
+					panic("fail to find matching proposal")
+				}
+
+				// execute the cmd and callback
+				if err = d.applyRaftCmd(req, proposal.cb); err != nil {
+					panic("fail to apply raft cmd")
+				}
+
+				if proposal.shouldDone {
+					proposal.cb.Done(nil) // proposal.cb.Resp is not nil
+				}
+			case eraftpb.EntryType_EntryConfChange:
+				panic("not support conf change now")
+			}
+		}
+
+		// update the apply state and persist them
+		if len(ready.CommittedEntries) > 0 {
+			d.peerStorage.applyState.AppliedIndex = ready.CommittedEntries[len(ready.CommittedEntries)-1].Index
+			if err := d.peerStorage.SaveApplyState(); err != nil {
+				panic("fail to save the apply state")
+			}
+		}
+
+		d.RaftGroup.Advance(ready)
+	}
+}
+
+// applyRaftCmd apply the passing cmd to kvdb and call cb.Done if necessary
+func (d *peerMsgHandler) applyRaftCmd(cmd *raft_cmdpb.Request, cb *message.Callback) error {
+	if cmd == nil || cb == nil {
+		return errors.Errorf("invalid arguments")
+	}
+
+	if cb.Resp == nil {
+		cb.Resp = newCmdResp()
+	}
+
+	switch cmd.CmdType {
+	case raft_cmdpb.CmdType_Put:
+		kvWB := new(engine_util.WriteBatch)
+		kvWB.SetCF(cmd.Put.Cf, cmd.Put.Key, cmd.Put.Value)
+		cb.Resp.Responses = append(cb.Resp.Responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Put, Put: &raft_cmdpb.PutResponse{}})
+		return d.peerStorage.Engines.WriteKV(kvWB)
+	case raft_cmdpb.CmdType_Delete:
+		kvWB := new(engine_util.WriteBatch)
+		kvWB.DeleteCF(cmd.Delete.Cf, cmd.Delete.Key)
+		cb.Resp.Responses = append(cb.Resp.Responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Delete, Delete: &raft_cmdpb.DeleteResponse{}})
+		return d.peerStorage.Engines.WriteKV(kvWB)
+	case raft_cmdpb.CmdType_Get:
+		return d.peerStorage.Engines.Kv.View(
+			func(txn *badger.Txn) error {
+				val, err := engine_util.GetCFFromTxn(txn, cmd.Get.Cf, cmd.Get.Key)
+				cb.Resp.Responses = append(cb.Resp.Responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Get, Get: &raft_cmdpb.GetResponse{Value: val}})
+				return err
+			})
+	case raft_cmdpb.CmdType_Snap:
+		panic("not support snap operation now")
+	}
+
+	return nil
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -114,6 +198,38 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		return
 	}
 	// Your Code Here (2B).
+
+	// handle the batched requests as a group, and only return when the final request complete
+	// e.g. client send Requests with Get and Put operations([Get, Put 1])
+	// the corresponding Response will be (["value", "put success"]) and call cb.Done when complete
+	// the Put operation
+	reqLen := len(msg.Requests)
+	lastIndex := d.peer.RaftGroup.Raft.RaftLog.LastIndex() // original index
+
+	// first loop just check if all the logs can be proposed
+	for _, req := range msg.Requests {
+		// propose the log
+		var err error
+		data, err := req.Marshal()
+		if err != nil {
+			cb.Done(ErrResp(err))
+			return
+		}
+		if err = d.peer.RaftGroup.Propose(data); err != nil {
+			cb.Done(ErrResp(err))
+			return
+		}
+
+		// save the callback
+	}
+
+	// second loop generates all the corresponding proposals
+	for ind := range msg.Requests {
+		lastIndex++
+		d.peer.proposals = append(d.peer.proposals, &proposal{index: lastIndex, term: d.peer.RaftGroup.Raft.Term, shouldDone: ind == reqLen-1, cb: cb})
+	}
+
+	// todo: handle the admin requests
 }
 
 func (d *peerMsgHandler) onTick() {

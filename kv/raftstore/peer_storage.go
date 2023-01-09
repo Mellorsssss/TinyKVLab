@@ -316,22 +316,23 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 		}
 	}
 
-	// delete the log entries will never be committed(the logs in range [newEntry.index+1, raftState.LastIndex])
-	lastIndex := entries[len(entries)-1].Index
-	lastTerm := entries[len(entries)-1].Term
-	for startKey := lastIndex + 1; startKey <= ps.raftState.LastIndex; startKey++ {
-		raftWB.DeleteMeta(meta.RaftLogKey(ps.region.Id, startKey))
+	// RaftLocalState consists of two parts, HardState & (LastIndex, LastTerm)
+	// HardState should be updated before call Append()
+	// (LastIndex, LastTerm) should be updated only when there are new entries to append
+	if len(entries) > 0 {
+		// delete the log entries will never be committed(the logs in range [newEntry.index+1, raftState.LastIndex])
+		lastIndex := entries[len(entries)-1].Index
+		lastTerm := entries[len(entries)-1].Term
+		for startKey := lastIndex + 1; startKey <= ps.raftState.LastIndex; startKey++ {
+			raftWB.DeleteMeta(meta.RaftLogKey(ps.region.Id, startKey))
+		}
+
+		// update the raftState(HardState should be updated before entering Append)
+		ps.raftState.LastIndex = lastIndex
+		ps.raftState.LastTerm = lastTerm
 	}
 
-	// update the raftState(HardState should be updated before entering Append)
-	// todo: need lock?
-	ps.raftState.LastIndex = lastIndex
-	ps.raftState.LastTerm = lastTerm
 	raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
-
-	if err := raftWB.WriteToDB(ps.Engines.Raft); err != nil {
-		return err
-	}
 
 	return nil
 }
@@ -358,14 +359,32 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	// Your Code Here (2B/2C).
 
 	// create a writeBatch to atomically update
+	// todo: should we persist the state first and then update in-memory state?
 	raftWB := new(engine_util.WriteBatch)
-	*ps.raftState.HardState = ready.HardState
+
+	if !raft.IsEmptyHardState(ready.HardState) {
+		*ps.raftState.HardState = ready.HardState
+	}
 
 	if err := ps.Append(ready.CommittedEntries, raftWB); err != nil {
 		return nil, err
 	}
 
 	return nil, nil
+}
+
+// SaveApplyState persist the applyState, make sure in-memory applyState is updated
+func (ps *PeerStorage) SaveApplyState() error {
+	raftWB := new(engine_util.WriteBatch)
+	if err := raftWB.SetMeta(meta.ApplyStateKey(ps.region.Id), ps.applyState); err != nil {
+		return err
+	}
+
+	if err := ps.Engines.WriteRaft(raftWB); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (ps *PeerStorage) ClearData() {

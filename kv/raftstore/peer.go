@@ -58,9 +58,10 @@ func replicatePeer(storeID uint64, cfg *config.Config, sched chan<- worker.Task,
 
 type proposal struct {
 	// index + term for unique identification
-	index uint64
-	term  uint64
-	cb    *message.Callback
+	index      uint64
+	term       uint64
+	shouldDone bool // true if this cb should call Done(for batched requests)
+	cb         *message.Callback
 }
 
 type peer struct {
@@ -389,4 +390,21 @@ func (p *peer) sendRaftMessage(msg eraftpb.Message, trans Transport) error {
 	}
 	sendMsg.Message = &msg
 	return trans.Send(sendMsg)
+}
+
+func (p *peer) GetProposeCallback(index uint64, term uint64) (pro *proposal, err error) {
+	// traverse the proposals and remove the corespoding propose
+	// corner case: if several requests are batched, only the last request has the callback
+	for ind, proposal := range p.proposals {
+		if proposal.index == index && proposal.term == term {
+			pro = proposal
+			if ind == 0 { // just truncate from the beginning
+				p.proposals = p.proposals[1:]
+			} else {
+				panic("proposal should be applied in ascending order")
+			}
+			return pro, nil
+		}
+	}
+	return nil, errors.Errorf("fail to find a matching proposal")
 }
