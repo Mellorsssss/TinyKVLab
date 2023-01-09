@@ -172,16 +172,29 @@ func newRaft(c *Config) *Raft {
 		panic(err.Error())
 	}
 	// Your Code Here (2A).
-	hardState, _, _ := c.Storage.InitialState()
+
+	hardState, confState, err := c.Storage.InitialState()
+	if err != nil {
+		panic(err.Error())
+	}
+
+	// if peers is empty, we will use confState
+	var peers []uint64
+	if len(c.peers) == 0 {
+		peers = confState.GetNodes()
+	} else {
+		peers = c.peers
+	}
+
 	return &Raft{
 		id:                  c.ID,
 		Term:                hardState.Term,
 		Vote:                hardState.Vote,
 		RaftLog:             newLog(c.Storage),
-		Prs:                 makePrs(c.peers),
+		Prs:                 makePrs(peers),
 		State:               StateFollower,
-		votes:               makeVotes(c.peers),
-		hasVoted:            makeVotes(c.peers),
+		votes:               makeVotes(peers),
+		hasVoted:            makeVotes(peers),
 		msgs:                []pb.Message{},
 		Lead:                0, // 0 is invalid for Lead
 		heartbeatTimeout:    c.HeartbeatTick,
@@ -378,9 +391,9 @@ func (r *Raft) stepFollower(m pb.Message) error {
 		m.To = r.Lead // is this legal?
 		r.msgs = append(r.msgs, m)
 	case pb.MessageType_MsgRequestVote:
-		fallthrough
-	case pb.MessageType_MsgRequestVoteResponse:
 		r.handleRequestVote(m)
+	case pb.MessageType_MsgRequestVoteResponse:
+		return nil
 	case pb.MessageType_MsgHeartbeat:
 		r.handleHeartbeat(m)
 	case pb.MessageType_MsgHeartbeatResponse:
@@ -425,8 +438,6 @@ func (r *Raft) stepCandidate(m pb.Message) error {
 		return nil // ignore
 	case pb.MessageType_MsgAppend:
 		r.handleAppendEntries(m)
-	default:
-		log.Fatalf("%v get unknown msg %v", r.id, m)
 	}
 
 	return nil
@@ -441,9 +452,9 @@ func (r *Raft) stepLeader(m pb.Message) error {
 	case pb.MessageType_MsgPropose:
 		r.handlePropose(m)
 	case pb.MessageType_MsgRequestVote:
-		fallthrough
-	case pb.MessageType_MsgRequestVoteResponse:
 		r.handleRequestVote(m)
+	case pb.MessageType_MsgRequestVoteResponse:
+		return nil
 	case pb.MessageType_MsgAppend:
 		fallthrough
 	case pb.MessageType_MsgAppendResponse:
@@ -511,10 +522,6 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 		r.msgs = append(r.msgs, pb.Message{MsgType: pb.MessageType_MsgRequestVoteResponse, From: r.id, To: m.From, Reject: false, Term: r.Term})
 
 	case pb.MessageType_MsgRequestVoteResponse:
-		if r.State == StateLeader {
-			log.Infof("%v get requestvote response but not a candiate now", r.id)
-			return
-		}
 
 		if m.Term != r.Term || r.hasVoted[m.From] { // reduant replies
 			log.Infof("%v get redudant grant from %v", r.id, m.From)
