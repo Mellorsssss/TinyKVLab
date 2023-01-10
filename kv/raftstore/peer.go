@@ -395,16 +395,16 @@ func (p *peer) sendRaftMessage(msg eraftpb.Message, trans Transport) error {
 func (p *peer) GetProposeCallback(index uint64, term uint64) (pro *proposal, err error) {
 	// traverse the proposals and remove the corespoding propose
 	// corner case: if several requests are batched, only the last request has the callback
+	log.Infof("%v begin to scan proposal %v, %v with %v proposal", p.Meta.Id, index, term, len(p.proposals))
 	for ind, proposal := range p.proposals {
 		if proposal.index == index && proposal.term == term {
 			pro = proposal
-			if ind == 0 { // just truncate from the beginning
-				p.proposals = p.proposals[1:]
-			} else {
-				panic("proposal should be applied in ascending order")
-			}
+
+			// delete the used proposal in a tricky way
+			p.proposals[ind] = p.proposals[len(p.proposals)-1]
+			p.proposals = p.proposals[0 : len(p.proposals)-1] // remove the current proposal
 			return pro, nil
 		}
 	}
-	return nil, errors.Errorf("fail to find a matching proposal")
+	return nil, errors.Errorf("fail to find a matching proposal of [%v, %v]", index, term)
 }
