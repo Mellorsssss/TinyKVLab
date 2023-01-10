@@ -19,6 +19,7 @@ import (
 	"math/rand"
 	"sort"
 
+	"github.com/Connor1996/badger/y"
 	"github.com/pingcap-incubator/tinykv/log"
 
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
@@ -285,7 +286,6 @@ func (r *Raft) bcastAppend() {
 func (r *Raft) sendRequestVote(to uint64) {
 	// Your Code Here (2A).
 	logTerm, _ := r.RaftLog.Term(r.RaftLog.LastIndex())
-	// todo: send logic
 	r.msgs = append(r.msgs, pb.Message{MsgType: pb.MessageType_MsgRequestVote, From: r.id, To: to, Term: r.Term, LogTerm: logTerm, Index: r.RaftLog.LastIndex()})
 }
 
@@ -438,6 +438,10 @@ func (r *Raft) stepCandidate(m pb.Message) error {
 		return nil // ignore
 	case pb.MessageType_MsgAppend:
 		r.handleAppendEntries(m)
+	case pb.MessageType_MsgAppendResponse:
+		return nil // ignore this
+	default:
+		log.Fatalf("%v get unknown msg %v", r.id, m)
 	}
 
 	return nil
@@ -490,7 +494,6 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 	// Your Code Here (2A).
 	switch m.MsgType {
 	case pb.MessageType_MsgRequestVote:
-		log.Infof("[%v,%v] get requestvote from [%v,%v]", r.id, r.Term, m.From, m.Term)
 
 		lastIndex := r.RaftLog.LastIndex()
 		lastTerm, _ := r.RaftLog.Term(lastIndex)
@@ -500,11 +503,12 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 		// 2. log is not as-new-as its
 		// 3. has voted to another one
 		if m.Term < r.Term {
-			log.Infof("[%v,%v] reject requestvote from [%v,%v]", r.id, r.Term, m.From, m.Term)
+			// log.Infof("[%v,%v] reject requestvote from [%v,%v]", r.id, r.Term, m.From, m.Term)
 			r.msgs = append(r.msgs, pb.Message{MsgType: pb.MessageType_MsgRequestVoteResponse, From: r.id, To: m.From, Reject: true, Term: r.Term})
 			return
 		}
 
+		log.Infof("[%v,%v] get requestvote from [%v,%v]", r.id, r.Term, m.From, m.Term)
 		if m.Term > r.Term {
 			r.becomeFollower(m.Term, 0)
 		}
@@ -516,7 +520,10 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 		}
 
 		// grant the vote
-		r.Vote = m.From
+		if r.Vote == 0 && r.State == StateFollower { // follower first grant the vote in this term
+			r.Vote = m.From
+			r.electionElapsed = 0 // since grant a vote to another candiate, reset the ticker
+		}
 
 		log.Infof("[%v,%v] grant requestvote from [%v,%v]", r.id, r.Term, m.From, m.Term)
 		r.msgs = append(r.msgs, pb.Message{MsgType: pb.MessageType_MsgRequestVoteResponse, From: r.id, To: m.From, Reject: false, Term: r.Term})
@@ -524,14 +531,14 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 	case pb.MessageType_MsgRequestVoteResponse:
 
 		if m.Term != r.Term || r.hasVoted[m.From] { // reduant replies
-			log.Infof("%v get redudant grant from %v", r.id, m.From)
+			// log.Infof("[%v, %v] get redudant grant from [%v, %v]", r.id, r.Term, m.From, m.Term)
 			return
 		}
 
 		r.hasVoted[m.From] = true
 
 		if !m.Reject { // vote granted
-			log.Infof("%v get grant from %v", r.id, m.From)
+			log.Infof("[%v, %v] get grant from [%v, %v]", r.id, r.Term, m.From, m.Term)
 			r.votes[m.From] = true
 
 			minVotes := (len(r.votes))/2 + 1 // at least minVotes to become leader
@@ -581,6 +588,9 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		if m.Term > r.Term || r.Lead != m.From { // optimize: if the peer is follower in the term, there couldn't be another leader
 			r.becomeFollower(m.Term, m.From)
 		}
+
+		y.Assert(r.State == StateFollower)
+		r.electionElapsed = 0 // since recive AppendEntries from current leder, reset the ticker
 
 		term, err := r.RaftLog.Term(m.Index)
 		if err != nil || term != m.LogTerm { // no log found with m.Index in local logs or mismatch
@@ -697,6 +707,8 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 			r.becomeFollower(m.Term, m.From)
 		}
 
+		y.Assert(r.State == StateFollower)
+		r.electionElapsed = 0
 		term, _ := r.RaftLog.Term(m.Index)
 		if term == 0 { // no log at m.Index
 			r.msgs = append(r.msgs, pb.Message{MsgType: pb.MessageType_MsgHeartbeatResponse, From: r.id, To: m.From, Term: r.Term, Reject: true})
