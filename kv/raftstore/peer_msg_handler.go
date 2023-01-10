@@ -65,16 +65,21 @@ func (d *peerMsgHandler) HandleRaftReady() {
 				}
 
 				proposal, err := d.GetProposeCallback(entry.Index, entry.Term)
-				if err != nil {
-					panic("fail to find matching proposal")
+				if err != nil && d.IsLeader() {
+					log.Errorf("leader [%v, %v] has no proposal for [%v, %v]", d.Meta.Id, d.RaftGroup.Raft.Term, entry.Index, entry.Term)
+				}
+
+				var cb *message.Callback
+				if proposal != nil {
+					cb = proposal.cb
 				}
 
 				// execute the cmd and callback
-				if err = d.applyRaftCmd(req, proposal.cb); err != nil {
+				if err = d.applyRaftCmd(req, cb); err != nil {
 					panic("fail to apply raft cmd")
 				}
 
-				if proposal.shouldDone {
+				if proposal != nil && proposal.shouldDone {
 					proposal.cb.Done(nil) // proposal.cb.Resp is not nil
 				}
 			case eraftpb.EntryType_EntryConfChange:
@@ -96,11 +101,11 @@ func (d *peerMsgHandler) HandleRaftReady() {
 
 // applyRaftCmd apply the passing cmd to kvdb and call cb.Done if necessary
 func (d *peerMsgHandler) applyRaftCmd(cmd *raft_cmdpb.Request, cb *message.Callback) error {
-	if cmd == nil || cb == nil {
+	if cmd == nil {
 		return errors.Errorf("invalid arguments")
 	}
 
-	if cb.Resp == nil {
+	if cb != nil && cb.Resp == nil {
 		cb.Resp = newCmdResp()
 	}
 
@@ -108,22 +113,35 @@ func (d *peerMsgHandler) applyRaftCmd(cmd *raft_cmdpb.Request, cb *message.Callb
 	case raft_cmdpb.CmdType_Put:
 		kvWB := new(engine_util.WriteBatch)
 		kvWB.SetCF(cmd.Put.Cf, cmd.Put.Key, cmd.Put.Value)
-		cb.Resp.Responses = append(cb.Resp.Responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Put, Put: &raft_cmdpb.PutResponse{}})
+		if cb != nil {
+			cb.Resp.Responses = append(cb.Resp.Responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Put, Put: &raft_cmdpb.PutResponse{}})
+		}
 		return d.peerStorage.Engines.WriteKV(kvWB)
 	case raft_cmdpb.CmdType_Delete:
 		kvWB := new(engine_util.WriteBatch)
 		kvWB.DeleteCF(cmd.Delete.Cf, cmd.Delete.Key)
-		cb.Resp.Responses = append(cb.Resp.Responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Delete, Delete: &raft_cmdpb.DeleteResponse{}})
+		if cb != nil {
+			cb.Resp.Responses = append(cb.Resp.Responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Delete, Delete: &raft_cmdpb.DeleteResponse{}})
+		}
 		return d.peerStorage.Engines.WriteKV(kvWB)
 	case raft_cmdpb.CmdType_Get:
 		return d.peerStorage.Engines.Kv.View(
 			func(txn *badger.Txn) error {
 				val, err := engine_util.GetCFFromTxn(txn, cmd.Get.Cf, cmd.Get.Key)
-				cb.Resp.Responses = append(cb.Resp.Responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Get, Get: &raft_cmdpb.GetResponse{Value: val}})
+				if cb != nil {
+					cb.Resp.Responses = append(cb.Resp.Responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Get, Get: &raft_cmdpb.GetResponse{Value: val}})
+				}
 				return err
 			})
 	case raft_cmdpb.CmdType_Snap:
-		panic("not support snap operation now")
+		return d.peerStorage.Engines.Kv.View(
+			func(txn *badger.Txn) error {
+				if cb != nil {
+					cb.Txn = txn
+					cb.Resp.Responses = append(cb.Resp.Responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Snap, Snap: &raft_cmdpb.SnapResponse{Region: d.Region()}})
+				}
+				return nil
+			})
 	}
 
 	return nil
@@ -213,11 +231,13 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		data, err := req.Marshal()
 		if err != nil {
 			cb.Done(ErrResp(err))
-			return
+			panic(err.Error())
+			// return
 		}
 		if err = d.peer.RaftGroup.Propose(data); err != nil {
 			cb.Done(ErrResp(err))
-			return
+			panic(err.Error())
+			// return
 		}
 
 		// save the callback
