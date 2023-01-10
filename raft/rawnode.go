@@ -86,6 +86,10 @@ func NewRawNode(config *Config) (*RawNode, error) {
 	return &RawNode{
 		Raft: rf,
 		ready: Ready{
+			SoftState: &SoftState{
+				Lead:      0,
+				RaftState: StateFollower,
+			},
 			HardState: pb.HardState{
 				Term:   rf.Term,
 				Vote:   rf.Vote,
@@ -167,38 +171,66 @@ func (rn *RawNode) Ready() Ready {
 	}
 
 	if len(rn.Raft.msgs) > 0 {
-		curReady.Messages = rn.Raft.msgs
+		curReady.Messages = append(curReady.Messages, rn.Raft.msgs...)
+		log.Infof("send out %v messages", len(rn.Raft.msgs))
+		rn.Raft.msgs = rn.Raft.msgs[:0]
 	}
 
 	// SoftState will be nil if no update
+	if rn.ready.SoftState.Lead != rn.Raft.Lead || rn.ready.SoftState.RaftState != rn.Raft.State {
+		curReady.SoftState = &SoftState{
+			Lead:      rn.Raft.Lead,
+			RaftState: rn.Raft.State,
+		}
+
+		// update the oracle SofteState too
+		rn.ready.SoftState.Lead = rn.Raft.Lead
+		rn.ready.SoftState.RaftState = rn.Raft.State
+	}
+
+	// HardState will be empty if no update
 	if rn.ready.HardState.Commit != rn.Raft.RaftLog.committed || rn.ready.HardState.Term != rn.Raft.Term || rn.ready.HardState.Vote != rn.Raft.Vote {
-		log.Infof("not the same!")
 		curReady.HardState = pb.HardState{
 			Term:   rn.Raft.Term,
 			Vote:   rn.Raft.Vote,
 			Commit: rn.Raft.RaftLog.committed,
 		}
-		curReady.SoftState = &SoftState{
-			Lead:      rn.Raft.Lead,
-			RaftState: rn.Raft.State,
-		}
-	} else {
-		log.Infof("just the same!")
+
+		// update the oracle HardState too
+		rn.ready.HardState = curReady.HardState
 	}
 
-	rn.ready = curReady
 	return curReady
 }
 
 // HasReady called when RawNode user need to check if any Ready pending.
 func (rn *RawNode) HasReady() bool {
 	// Your Code Here (2A).
-	// todo: more efficient?
 
-	if len(rn.Raft.RaftLog.unstableEntries()) > 0 || len(rn.Raft.RaftLog.nextEnts()) > 0 || len(rn.Raft.msgs) > 0 {
+	// SoftState is updated
+	if rn.ready.SoftState == nil {
+		// for the first SoftState, just update it and call the ready
+		rn.ready.SoftState = &SoftState{Lead: rn.Raft.Lead, RaftState: rn.Raft.State}
+		return true
+	} else if rn.Raft.Lead != rn.ready.Lead || rn.Raft.State != rn.ready.RaftState {
+		// for the next SoftState, we don't update now to let the Ready() know that SoftState is out-dated
 		return true
 	}
 
+	// HardState is updated
+	if rn.Raft.Term != rn.ready.Term || rn.Raft.Vote != rn.ready.Vote || rn.Raft.RaftLog.committed != rn.ready.Commit {
+		return true
+	}
+
+	// Entries need to be persisted or applied
+	if len(rn.Raft.RaftLog.unstableEntries()) > 0 || len(rn.Raft.RaftLog.nextEnts()) > 0 {
+		return true
+	}
+
+	// messages need to be sent out
+	if len(rn.Raft.msgs) > 0 {
+		return true
+	}
 	return false
 }
 
