@@ -48,7 +48,8 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	// Your Code Here (2B).
 	if d.peer.RaftGroup.HasReady() {
 		ready := d.peer.RaftGroup.Ready()
-		// todo: handle the apply result
+
+		// save the unstable entries and persist the raftState
 		if _, err := d.peer.peerStorage.SaveReadyState(&ready); err != nil {
 			panic("fail to save ready state")
 		}
@@ -79,7 +80,7 @@ func (d *peerMsgHandler) HandleRaftReady() {
 					panic("fail to apply raft cmd")
 				}
 
-				if proposal != nil && proposal.shouldDone {
+				if proposal != nil && proposal.shouldDone && d.IsLeader() {
 					proposal.cb.Done(nil) // proposal.cb.Resp is not nil
 				}
 			case eraftpb.EntryType_EntryConfChange:
@@ -125,6 +126,9 @@ func (d *peerMsgHandler) applyRaftCmd(cmd *raft_cmdpb.Request, cb *message.Callb
 		}
 		return d.peerStorage.Engines.WriteKV(kvWB)
 	case raft_cmdpb.CmdType_Get:
+		if cb == nil {
+			return nil
+		}
 		return d.peerStorage.Engines.Kv.View(
 			func(txn *badger.Txn) error {
 				val, err := engine_util.GetCFFromTxn(txn, cmd.Get.Cf, cmd.Get.Key)
@@ -134,6 +138,9 @@ func (d *peerMsgHandler) applyRaftCmd(cmd *raft_cmdpb.Request, cb *message.Callb
 				return err
 			})
 	case raft_cmdpb.CmdType_Snap:
+		if cb == nil {
+			return nil
+		}
 		return d.peerStorage.Engines.Kv.View(
 			func(txn *badger.Txn) error {
 				if cb != nil {
@@ -222,31 +229,33 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 	// the corresponding Response will be (["value", "put success"]) and call cb.Done when complete
 	// the Put operation
 	reqLen := len(msg.Requests)
-	lastIndex := d.peer.RaftGroup.Raft.RaftLog.LastIndex() // original index
 
 	// first loop just check if all the logs can be proposed
-	for _, req := range msg.Requests {
+	for ind, req := range msg.Requests {
 		// propose the log
+		// record the proposal
+		d.peer.proposals = append(d.peer.proposals, &proposal{index: d.nextProposalIndex(), term: d.Term(), shouldDone: ind == reqLen-1, cb: cb})
+		oldIndex := d.nextProposalIndex()
+		oldTerm := d.Term()
+
 		var err error
 		data, err := req.Marshal()
 		if err != nil {
-			cb.Done(ErrResp(err))
 			panic(err.Error())
+			// cb.Done(ErrResp(err))
 			// return
 		}
 		if err = d.peer.RaftGroup.Propose(data); err != nil {
-			cb.Done(ErrResp(err))
 			panic(err.Error())
+			// cb.Done(ErrResp(err))
 			// return
 		}
 
-		// save the callback
-	}
-
-	// second loop generates all the corresponding proposals
-	for ind := range msg.Requests {
-		lastIndex++
-		d.peer.proposals = append(d.peer.proposals, &proposal{index: lastIndex, term: d.peer.RaftGroup.Raft.Term, shouldDone: ind == reqLen-1, cb: cb})
+		newTerm, err := d.RaftGroup.Raft.RaftLog.Term(oldIndex)
+		if err != nil || d.RaftGroup.Raft.RaftLog.LastIndex() != oldIndex || newTerm != oldTerm {
+			errorString := fmt.Sprintf("index and term mismatch:[%v, %v] vs [%v, %v]", oldIndex, oldTerm, d.RaftGroup.Raft.RaftLog.FirstIndex(), newTerm)
+			panic(errorString)
+		}
 	}
 
 	// todo: handle the admin requests

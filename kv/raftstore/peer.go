@@ -395,14 +395,15 @@ func (p *peer) sendRaftMessage(msg eraftpb.Message, trans Transport) error {
 func (p *peer) GetProposeCallback(index uint64, term uint64) (pro *proposal, err error) {
 	// traverse the proposals and remove the corespoding propose
 	// corner case: if several requests are batched, only the last request has the callback
-	log.Infof("%v begin to scan proposal %v, %v with %v proposal", p.Meta.Id, index, term, len(p.proposals))
 	for ind, proposal := range p.proposals {
 		if proposal.index == index && proposal.term == term {
 			pro = proposal
 
-			// delete the used proposal in a tricky way
-			p.proposals[ind] = p.proposals[len(p.proposals)-1]
-			p.proposals = p.proposals[0 : len(p.proposals)-1] // remove the current proposal
+			// delete previous proposals since proposals must be used one after one
+			if len(p.proposals) != ind-1 {
+				p.proposals = p.proposals[ind+1:]
+			}
+
 			return pro, nil
 		}
 	}
