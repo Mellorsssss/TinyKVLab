@@ -366,7 +366,7 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 		*ps.raftState.HardState = ready.HardState
 	}
 
-	if err := ps.Append(ready.CommittedEntries, raftWB); err != nil {
+	if err := ps.Append(ready.Entries, raftWB); err != nil {
 		return nil, err
 	}
 
