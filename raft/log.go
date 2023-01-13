@@ -70,12 +70,19 @@ func newLog(storage Storage) *RaftLog {
 	lo, _ := storage.FirstIndex()
 	hi, _ := storage.LastIndex()
 	ents, _ := storage.Entries(lo, hi+1)
+	var stabled uint64
+	if len(ents) > 0 {
+		stabled = ents[len(ents)-1].Index
+	} else {
+		stabled = hi
+	}
+
 	snapshot, _ := storage.Snapshot()
 	return &RaftLog{
 		storage:         storage,
 		committed:       hardState.Commit,
-		applied:         lo - 1, // apply from the first possible log
-		stabled:         hi,     // todo: is this wrong?
+		applied:         lo - 1,  // apply from the first possible log
+		stabled:         stabled, // todo: is this wrong?
 		entries:         ents,
 		pendingSnapshot: &snapshot,
 	}
@@ -153,7 +160,11 @@ func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
 	// todo: add support for snapshot
 	if len(l.entries) == 0 { // no entries, just return 0
-		return 0
+		if lastIndex, err := l.storage.LastIndex(); err != nil {
+			panic(err.Error())
+		} else {
+			return lastIndex
+		}
 	}
 
 	return l.entries[len(l.entries)-1].Index
@@ -164,12 +175,11 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
 	// todo: add support for snapshot
 
-	// when acquire the non-existed log, return term 0
-	if i == 0 {
-		return 0, nil
+	if len(l.entries) == 0 || i < l.entries[0].Index {
+		return l.storage.Term(i)
 	}
 
-	if len(l.entries) == 0 || i < l.entries[0].Index || i > l.LastIndex() {
+	if i > l.LastIndex() {
 		return 0, errors.New("fail to find matching index in log")
 	}
 
@@ -183,7 +193,11 @@ func (l *RaftLog) FirstIndex() uint64 {
 	// Your Code Here (2A).
 	// todo: add support for snapshot
 	if len(l.entries) == 0 { // no entries, just return 0
-		return 1
+		if firstIndex, err := l.storage.FirstIndex(); err != nil {
+			panic(err.Error())
+		} else {
+			return firstIndex
+		}
 	}
 
 	return l.entries[0].Index

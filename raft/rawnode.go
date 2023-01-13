@@ -241,7 +241,7 @@ func (rn *RawNode) Advance(rd Ready) {
 
 	if len(rd.Entries) > 0 {
 		stabled := rd.Entries[len(rd.Entries)-1].Index
-		rn.Raft.RaftLog.stabled = max(rn.Raft.RaftLog.stabled, stabled)
+		rn.Raft.RaftLog.stabled = stabled // already stabled entries maybe truncated
 	}
 
 	if len(rd.CommittedEntries) > 0 {

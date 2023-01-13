@@ -16,6 +16,7 @@ package raft
 
 import (
 	"errors"
+	"fmt"
 	"math/rand"
 	"sort"
 
@@ -216,7 +217,8 @@ func (r *Raft) sendAppend(to uint64) bool {
 	logTerm, err := r.RaftLog.Term(r.Prs[to].Next - 1)
 	if err != nil { // log not found
 		log.Infof("%v fail to find prev log with %v", r.id, r.Prs[to].Next)
-		panic("prev log should exsits")
+		errorString := fmt.Sprintf("%v fail to find prev log with %v with logs %v", r.id, r.Prs[to].Next, r.RaftLog.entries)
+		panic(errorString)
 	}
 
 	log.Infof("%v send to %v, prevIndex: %v, pervTerm: %v", r.id, to, r.Prs[to].Next-1, logTerm)
@@ -636,9 +638,12 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 					offset := ent.Index - r.RaftLog.entries[0].Index
 					r.RaftLog.entries = append([]pb.Entry{}, r.RaftLog.entries[:offset]...)
 
-					r.RaftLog.stabled = r.RaftLog.LastIndex()
-
-					log.Infof("%v trunc logs from %v", r.id, offset)
+					// reset the stabled to make sure unstableEntries return the right entries
+					if len(r.RaftLog.entries) > 0 {
+						r.RaftLog.stabled = min(r.RaftLog.stabled, r.RaftLog.LastIndex())
+					} else {
+						r.RaftLog.stabled = r.RaftLog.FirstIndex() - 1 // all the entries are not stabled
+					}
 
 					for _, ent := range m.Entries[ind:] {
 						r.RaftLog.entries = append(r.RaftLog.entries, *ent)
