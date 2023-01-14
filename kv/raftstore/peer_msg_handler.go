@@ -150,7 +150,6 @@ func (d *peerMsgHandler) applyRaftCmd(cmd *raft_cmdpb.Request, cb *message.Callb
 				return nil
 			})
 	default:
-		log.Errorf("the error type is %v", cmd.CmdType)
 		return nil
 	}
 }

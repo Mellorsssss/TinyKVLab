@@ -378,6 +378,7 @@ func (r *Raft) stepFollower(m pb.Message) error {
 		log.Infof("%v get msg hup and begin a new election", r.id)
 
 		if len(r.votes) == 1 {
+			log.Errorf("%v get %v votes and become leader of term %v", r.id, 1, r.Term)
 			r.becomeLeader()
 		} else {
 			// send requestvote to all the peers
@@ -417,6 +418,7 @@ func (r *Raft) stepCandidate(m pb.Message) error {
 		r.becomeCandidate()
 		log.Infof("%v get msg hup and begin a new election", r.id)
 		if len(r.votes) == 1 {
+			log.Errorf("%v get %v votes and become leader of term %v", r.id, 1, r.Term)
 			r.becomeLeader()
 		} else {
 			// send requestvote to all the peers
@@ -552,6 +554,7 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 			}
 
 			if voteCnt >= minVotes {
+				log.Errorf("%v get %v votes and become leader of term %v", r.id, voteCnt, r.Term)
 				r.becomeLeader()
 			}
 		} else {
