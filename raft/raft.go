@@ -685,6 +685,9 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		// maintain the Prs
 		if m.Reject {
 			log.Infof("[%v, %v] get append reject response from [%v, %v]", r.id, r.Term, m.From, m.Term)
+			if m.Term > r.Term {
+				r.becomeFollower(m.Term, 0)
+			}
 			// todo: snapshot support
 			if r.Prs[m.From].Next != r.RaftLog.FirstIndex() {
 				r.Prs[m.From].Next--
@@ -741,7 +744,7 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 			log.Infof("%v get heart beat rej from %v", r.id, m.From)
 
 			if m.Term > r.Term { // degrade to Follower
-				r.becomeFollower(m.From, m.Term)
+				r.becomeFollower(m.Term, 0)
 			} else if r.Prs[m.From].Next != r.RaftLog.FirstIndex() { // update the Next
 				r.Prs[m.From].Next--
 			}
