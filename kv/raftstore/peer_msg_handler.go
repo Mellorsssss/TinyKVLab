@@ -57,6 +57,13 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		// send all the outbound messages
 		d.Send(d.ctx.trans, ready.Messages)
 
+		// todo: maybe we could save some proposals?
+		// remove the previous proposals since we are no more leader,
+		// in case of return a wrong RPC (safe but not efficient)
+		if !d.IsLeader() {
+			d.ClearProposals()
+		}
+
 		for _, entry := range ready.CommittedEntries {
 			switch entry.EntryType {
 			case eraftpb.EntryType_EntryNormal:

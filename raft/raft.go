@@ -320,9 +320,11 @@ func (r *Raft) tick() {
 func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	// Your Code Here (2A).
 	log.Infof("%v becomes follower with term %v and lead %v", r.id, term, lead)
+	if term > r.Term {
+		r.Vote = 0 // since term increase, Vote should be reset
+	}
 	r.Term = term
 	r.Lead = lead
-	r.Vote = 0
 	r.State = StateFollower
 }
 

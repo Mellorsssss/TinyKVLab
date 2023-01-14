@@ -393,28 +393,47 @@ func (p *peer) sendRaftMessage(msg eraftpb.Message, trans Transport) error {
 }
 
 func (p *peer) GetProposeCallback(index uint64, term uint64) (pro *proposal, err error) {
-	// traverse the proposals and remove the corespoding propose
+	pro = nil
+	err = errors.Errorf("fail to find a matching proposal of [%v, %v]", index, term)
+
+	// traverse the proposals and remove the out-dated proposal
 	// corner case: if several requests are batched, only the last request has the callback
-	for ind, proposal := range p.proposals {
-		if proposal.index == index && proposal.term == term {
-			pro = proposal
-
-			// delete previous proposals since proposals must be used one after one
-			if len(p.proposals) != ind-1 {
-				p.proposals = p.proposals[ind+1:]
+	for len(p.proposals) > 0 {
+		proposal := p.proposals[0]
+		if term < proposal.term { // must not find a match proposal
+			return
+		} else if term == proposal.term {
+			if index < proposal.index { // must not has match proposal
+				return
+			} else if index > proposal.index { // may find a match proposal
+				NotifyStaleReq(term, proposal.cb)
+				p.proposals = p.proposals[1:]
+			} else { // find a match proposal
+				p.proposals = p.proposals[1:]
+				return proposal, nil
 			}
-
-			return pro, nil
+		} else if term > proposal.term { // must not find a match proposal
+			NotifyStaleReq(term, proposal.cb)
+			p.proposals = p.proposals[1:]
 		}
 	}
-	return nil, errors.Errorf("fail to find a matching proposal of [%v, %v]", index, term)
+	return
 }
 
 func (p *peer) PushProposeCallback(index, term uint64, shouldDone bool, cb *message.Callback) error {
-	if _, err := p.GetProposeCallback(index, term); err == nil {
-		panic("propose existing")
-	}
-
 	p.proposals = append(p.proposals, &proposal{index: index, term: term, shouldDone: shouldDone, cb: cb})
 	return nil
+}
+
+// clear all the proposals and notify them
+func (p *peer) ClearProposals() {
+	if p.IsLeader() {
+		log.Errorf("leader [%v, %v] call the clear proposals", p.Meta.Id, p.Term())
+		return
+	}
+
+	for _, proposal := range p.proposals {
+		proposal.cb.Done(ErrResp(new(util.ErrNotLeader)))
+	}
+	p.proposals = p.proposals[:0]
 }
