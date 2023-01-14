@@ -307,10 +307,14 @@ func (c *Cluster) MustPutCF(cf string, key, value []byte) {
 		panic(resp.Header.Error)
 	}
 	if len(resp.Responses) != 1 {
-		panic("len(resp.Responses) != 1")
+		errorString := fmt.Sprintf("len(resp.Responses) is %v", len(resp.Responses))
+		panic(errorString)
+		// panic("len(resp.Responses) != 1")
 	}
 	if resp.Responses[0].CmdType != raft_cmdpb.CmdType_Put {
-		panic("resp.Responses[0].CmdType != raft_cmdpb.CmdType_Put")
+		errorString := fmt.Sprintf("resp.Responses[0].CmdType is %v", resp.Responses[0].CmdType)
+		panic(errorString)
+		// panic("resp.Responses[0].CmdType != raft_cmdpb.CmdType_Put")
 	}
 }
 
@@ -332,10 +336,14 @@ func (c *Cluster) GetCF(cf string, key []byte) []byte {
 		panic(resp.Header.Error)
 	}
 	if len(resp.Responses) != 1 {
-		panic("len(resp.Responses) != 1")
+		errorString := fmt.Sprintf("len(resp.Responses) is %v", len(resp.Responses))
+		panic(errorString)
+		// panic("len(resp.Responses) != 1")
 	}
 	if resp.Responses[0].CmdType != raft_cmdpb.CmdType_Get {
-		panic("resp.Responses[0].CmdType != raft_cmdpb.CmdType_Get")
+		errorString := fmt.Sprintf("resp.Responses[0].CmdType is %v", resp.Responses[0].CmdType)
+		panic(errorString)
+		// panic("resp.Responses[0].CmdType != raft_cmdpb.CmdType_Get")
 	}
 	return resp.Responses[0].Get.Value
 }
@@ -351,10 +359,14 @@ func (c *Cluster) MustDeleteCF(cf string, key []byte) {
 		panic(resp.Header.Error)
 	}
 	if len(resp.Responses) != 1 {
-		panic("len(resp.Responses) != 1")
+		errorString := fmt.Sprintf("len(resp.Responses) is %v", len(resp.Responses))
+		panic(errorString)
+		// panic("len(resp.Responses) != 1")
 	}
 	if resp.Responses[0].CmdType != raft_cmdpb.CmdType_Delete {
-		panic("resp.Responses[0].CmdType != raft_cmdpb.CmdType_Delete")
+		errorString := fmt.Sprintf("resp.Responses[0].CmdType is %v", resp.Responses[0].CmdType)
+		panic(errorString)
+		// panic("resp.Responses[0].CmdType != raft_cmdpb.CmdType_Delete")
 	}
 }
 
@@ -368,10 +380,14 @@ func (c *Cluster) Scan(start, end []byte) [][]byte {
 			panic(resp.Header.Error)
 		}
 		if len(resp.Responses) != 1 {
-			panic("len(resp.Responses) != 1")
+			errorString := fmt.Sprintf("len(resp.Responses) is %v", len(resp.Responses))
+			panic(errorString)
+			// panic("len(resp.Responses) != 1")
 		}
 		if resp.Responses[0].CmdType != raft_cmdpb.CmdType_Snap {
-			panic("resp.Responses[0].CmdType != raft_cmdpb.CmdType_Snap")
+			errorString := fmt.Sprintf("resp.Responses[0].CmdType is %v", resp.Responses[0].CmdType)
+			panic(errorString)
+			// panic("resp.Responses[0].CmdType != raft_cmdpb.CmdType_Snap")
 		}
 		region := resp.Responses[0].GetSnap().Region
 		iter := raft_storage.NewRegionReader(txn, *region).IterCF(engine_util.CfDefault)
