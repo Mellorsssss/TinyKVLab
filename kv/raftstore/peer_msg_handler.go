@@ -149,9 +149,10 @@ func (d *peerMsgHandler) applyRaftCmd(cmd *raft_cmdpb.Request, cb *message.Callb
 				}
 				return nil
 			})
+	default:
+		log.Errorf("the error type is %v", cmd.CmdType)
+		return nil
 	}
-
-	return nil
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -234,7 +235,8 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 	for ind, req := range msg.Requests {
 		// propose the log
 		// record the proposal
-		d.peer.proposals = append(d.peer.proposals, &proposal{index: d.nextProposalIndex(), term: d.Term(), shouldDone: ind == reqLen-1, cb: cb})
+		// d.peer.proposals = append(d.peer.proposals, &proposal{index: d.nextProposalIndex(), term: d.Term(), shouldDone: ind == reqLen-1, cb: cb})
+		d.peer.PushProposeCallback(d.nextProposalIndex(), d.Term(), ind == reqLen-1, cb)
 		oldIndex := d.nextProposalIndex()
 		oldTerm := d.Term()
 

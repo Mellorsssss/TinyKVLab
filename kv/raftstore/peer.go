@@ -409,3 +409,12 @@ func (p *peer) GetProposeCallback(index uint64, term uint64) (pro *proposal, err
 	}
 	return nil, errors.Errorf("fail to find a matching proposal of [%v, %v]", index, term)
 }
+
+func (p *peer) PushProposeCallback(index, term uint64, shouldDone bool, cb *message.Callback) error {
+	if _, err := p.GetProposeCallback(index, term); err == nil {
+		panic("propose existing")
+	}
+
+	p.proposals = append(p.proposals, &proposal{index: index, term: term, shouldDone: shouldDone, cb: cb})
+	return nil
+}
