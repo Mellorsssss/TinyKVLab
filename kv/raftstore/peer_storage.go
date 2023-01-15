@@ -332,6 +332,10 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 		ps.raftState.LastTerm = lastTerm
 	}
 
+	if ps.raftState.HardState.Commit > ps.raftState.LastIndex {
+		errorString := fmt.Sprintf("commit %v is larger than last index %v in term %v", ps.raftState.HardState.Commit, ps.raftState.LastIndex, ps.raftState.HardState.Term)
+		panic(errorString)
+	}
 	raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
 
 	return nil
