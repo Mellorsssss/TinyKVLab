@@ -16,6 +16,7 @@ package raft
 
 import (
 	"errors"
+	"fmt"
 
 	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
@@ -172,7 +173,7 @@ func (rn *RawNode) Ready() Ready {
 
 	if len(rn.Raft.msgs) > 0 {
 		curReady.Messages = append(curReady.Messages, rn.Raft.msgs...)
-		log.Infof("send out %v messages", len(rn.Raft.msgs))
+		log.Infof("%v send out %v messages", rn.Raft.id, len(rn.Raft.msgs))
 		rn.Raft.msgs = rn.Raft.msgs[:0]
 	}
 
@@ -245,6 +246,10 @@ func (rn *RawNode) Advance(rd Ready) {
 	}
 
 	if len(rd.CommittedEntries) > 0 {
+		if rd.CommittedEntries[len(rd.CommittedEntries)-1].Index != rn.Raft.RaftLog.committed {
+			errorString := fmt.Sprintf("commit not equal in term %v: %v, %v", rn.Raft.Term, rd.CommittedEntries[len(rd.CommittedEntries)-1].Index, rn.Raft.RaftLog.committed)
+			panic(errorString)
+		}
 		applied := rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
 		rn.Raft.RaftLog.applied = max(rn.Raft.RaftLog.applied, applied)
 	}

@@ -214,6 +214,10 @@ func newRaft(c *Config) *Raft {
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
 
+	if r.State != StateLeader { // only the leader could sent AppendEntries
+		return false
+	}
+
 	logTerm, err := r.RaftLog.Term(r.Prs[to].Next - 1)
 	if err != nil { // log not found
 		log.Infof("%v fail to find prev log with %v", r.id, r.Prs[to].Next)
@@ -250,6 +254,10 @@ func (r *Raft) sendAppend(to uint64) bool {
 // sendHeartbeat sends a heartbeat RPC to the given peer.
 func (r *Raft) sendHeartbeat(to uint64) {
 	// Your Code Here (2A).
+	if r.State != StateLeader {
+		return
+	}
+
 	log.Infof("leader %v send heartbeat to %v", r.id, to)
 	logTerm, _ := r.RaftLog.Term(r.Prs[to].Next - 1)
 	// todo: send logic
@@ -531,7 +539,7 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 			r.electionElapsed = 0 // since grant a vote to another candiate, reset the ticker
 		}
 
-		log.Infof("[%v,%v] grant requestvote from [%v,%v]", r.id, r.Term, m.From, m.Term)
+		log.Errorf("[%v,%v] grant requestvote from [%v,%v]", r.id, r.Term, m.From, m.Term)
 		r.msgs = append(r.msgs, pb.Message{MsgType: pb.MessageType_MsgRequestVoteResponse, From: r.id, To: m.From, Reject: false, Term: r.Term})
 
 	case pb.MessageType_MsgRequestVoteResponse:
@@ -556,7 +564,7 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 			}
 
 			if voteCnt >= minVotes {
-				log.Errorf("%v get %v votes and become leader of term %v", r.id, voteCnt, r.Term)
+				log.Errorf("%v get %v votes and become leader of term %v with commit %v", r.id, voteCnt, r.Term, r.RaftLog.committed)
 				r.becomeLeader()
 			}
 		} else {
@@ -592,7 +600,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 			return
 		}
 
-		if m.Term > r.Term || r.Lead != m.From { // optimize: if the peer is follower in the term, there couldn't be another leader
+		if m.Term > r.Term || (r.Lead != m.From && r.State != StateLeader) { // optimize: if the peer is follower in the term, there couldn't be another leader
 			r.becomeFollower(m.Term, m.From)
 		}
 
@@ -673,6 +681,10 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 			r.RaftLog.committed = max(r.RaftLog.committed, min(m.Commit, lastNewIndex))
 		}
 
+		if r.RaftLog.committed > r.RaftLog.LastIndex() {
+			log.Errorf("[%v, %v] commit %v larger than last index %v, %v, %v, and logs %v", r.id, r.Term, r.RaftLog.committed, r.RaftLog.LastIndex(), m.Commit, lastNewIndex, r.RaftLog.allEntries())
+		}
+
 		r.msgs = append(r.msgs, pb.Message{
 			MsgType: pb.MessageType_MsgAppendResponse,
 			From:    r.id,
@@ -716,7 +728,7 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 			return
 		}
 
-		if m.Term > r.Term || r.Lead != m.From { // optimize: if the peer is follower in the term, there couldn't be another leader
+		if m.Term > r.Term || (r.Lead != m.From && r.State != StateLeader) { // optimize: if the peer is follower in the term, there couldn't be another leader
 			r.becomeFollower(m.Term, m.From)
 		}
 
@@ -731,6 +743,10 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 		// update committed
 		if m.Commit > r.RaftLog.committed {
 			r.RaftLog.committed = max(r.RaftLog.committed, min(m.Commit, m.Index))
+		}
+
+		if r.RaftLog.committed > r.RaftLog.LastIndex() {
+			log.Errorf("[%v, %v] commit %v larger than last index %v, %v, and logs %v", r.id, r.Term, r.RaftLog.committed, r.RaftLog.LastIndex(), m.Commit, r.RaftLog.allEntries())
 		}
 
 		// return the last matching index too
@@ -836,7 +852,6 @@ func (r *Raft) tryUpdateCommit() bool {
 			return false
 		}
 		r.RaftLog.committed = matchs[th-1]
-		log.Infof("%v update commit to %v", r.id, r.RaftLog.committed)
 
 		// when advance commit index, broad cast append entries
 		// todo: when?

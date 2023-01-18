@@ -333,8 +333,7 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 	}
 
 	if ps.raftState.HardState.Commit > ps.raftState.LastIndex {
-		errorString := fmt.Sprintf("commit %v is larger than last index %v in term %v", ps.raftState.HardState.Commit, ps.raftState.LastIndex, ps.raftState.HardState.Term)
-		panic(errorString)
+		log.Errorf("%v %v commit %v is larger than last index %v in term %v", ps.Tag, ps.region.Id, ps.raftState.HardState.Commit, ps.raftState.LastIndex, ps.raftState.HardState.Term)
 	}
 	raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
 
@@ -374,6 +373,11 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 		return nil, err
 	}
 
+	if len(ready.CommittedEntries) > 0 {
+		if ready.CommittedEntries[len(ready.CommittedEntries)-1].Index != ps.raftState.HardState.Commit {
+			log.Errorf("%v's commit %v is not equal to last committed entry index %v", ps.Tag, ready.CommittedEntries[len(ready.CommittedEntries)-1].Index, ps.raftState.HardState.Commit)
+		}
+	}
 	if err := raftWB.WriteToDB(ps.Engines.Raft); err != nil {
 		return nil, err
 	}
