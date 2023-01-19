@@ -7,6 +7,7 @@ import (
 	"github.com/Connor1996/badger"
 	"github.com/Connor1996/badger/y"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/message"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/runner"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/snap"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
@@ -67,29 +68,7 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		for _, entry := range ready.CommittedEntries {
 			switch entry.EntryType {
 			case eraftpb.EntryType_EntryNormal:
-				req := new(raft_cmdpb.Request)
-				if err := req.Unmarshal(entry.Data); err != nil {
-					panic("fail to unmarshal the cmdEntry")
-				}
-
-				proposal, err := d.GetProposeCallback(entry.Index, entry.Term)
-				if err != nil && d.IsLeader() {
-					log.Errorf("leader [%v, %v] has no proposal for [%v, %v]", d.Meta.Id, d.RaftGroup.Raft.Term, entry.Index, entry.Term)
-				}
-
-				var cb *message.Callback
-				if proposal != nil {
-					cb = proposal.cb
-				}
-
-				// execute the cmd and callback
-				if err = d.applyRaftCmd(req, cb); err != nil {
-					panic("fail to apply raft cmd")
-				}
-
-				if proposal != nil && proposal.shouldDone && d.IsLeader() {
-					proposal.cb.Done(nil) // proposal.cb.Resp is not nil
-				}
+				d.applyNormalEntry(&entry)
 			case eraftpb.EntryType_EntryConfChange:
 				panic("not support conf change now")
 			}
@@ -107,58 +86,94 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	}
 }
 
+func (d *peerMsgHandler) applyNormalEntry(entry *eraftpb.Entry) {
+	if entry == nil {
+		log.Panic("get nil entry")
+	}
+
+	proposal, err := d.GetProposeCallback(entry.Index, entry.Term)
+	if err != nil && d.IsLeader() {
+		log.Errorf("leader [%v, %v] has no proposal for [%v, %v]", d.Meta.Id, d.RaftGroup.Raft.Term, entry.Index, entry.Term)
+	}
+
+	var cb *message.Callback
+	if proposal != nil {
+		cb = proposal.cb
+	}
+
+	// execute the cmd and callback
+	if err = d.executeKVCmd(entry, cb); err != nil {
+		log.Panic("fail to apply raft cmd")
+	}
+
+	if proposal != nil && proposal.shouldDone && d.IsLeader() {
+		proposal.cb.Done(nil) // proposal.cb.Resp is not nil
+	}
+}
+
 // applyRaftCmd apply the passing cmd to kvdb and call cb.Done if necessary
-func (d *peerMsgHandler) applyRaftCmd(cmd *raft_cmdpb.Request, cb *message.Callback) error {
-	if cmd == nil {
-		return errors.Errorf("invalid arguments")
+func (d *peerMsgHandler) executeKVCmd(entry *eraftpb.Entry, cb *message.Callback) error {
+	cmd := new(raft_cmdpb.Request)
+	if err := cmd.Unmarshal(entry.Data); err != nil {
+		log.Panic("fail to unmarshal the cmdEntry")
 	}
 
 	if cb != nil && cb.Resp == nil {
 		cb.Resp = newCmdResp()
 	}
 
+	kvWB := new(engine_util.WriteBatch)
+	d.peerStorage.applyState.AppliedIndex = entry.Index // it's safe to change the apply index first because of write batch
+	if err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState); err != nil {
+		log.Panicf("fail to persist the apply state %v", d.peerStorage.applyState)
+	}
+
 	switch cmd.CmdType {
 	case raft_cmdpb.CmdType_Put:
-		kvWB := new(engine_util.WriteBatch)
 		kvWB.SetCF(cmd.Put.Cf, cmd.Put.Key, cmd.Put.Value)
 		if cb != nil {
 			cb.Resp.Responses = append(cb.Resp.Responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Put, Put: &raft_cmdpb.PutResponse{}})
 		}
-		return d.peerStorage.Engines.WriteKV(kvWB)
 	case raft_cmdpb.CmdType_Delete:
-		kvWB := new(engine_util.WriteBatch)
 		kvWB.DeleteCF(cmd.Delete.Cf, cmd.Delete.Key)
 		if cb != nil {
 			cb.Resp.Responses = append(cb.Resp.Responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Delete, Delete: &raft_cmdpb.DeleteResponse{}})
 		}
-		return d.peerStorage.Engines.WriteKV(kvWB)
 	case raft_cmdpb.CmdType_Get:
 		if cb == nil {
 			return nil
 		}
-		return d.peerStorage.Engines.Kv.View(
+
+		if err := d.peerStorage.Engines.Kv.View(
 			func(txn *badger.Txn) error {
 				val, err := engine_util.GetCFFromTxn(txn, cmd.Get.Cf, cmd.Get.Key)
 				if cb != nil {
 					cb.Resp.Responses = append(cb.Resp.Responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Get, Get: &raft_cmdpb.GetResponse{Value: val}})
 				}
 				return err
-			})
+			}); err != nil {
+			return err
+		}
 	case raft_cmdpb.CmdType_Snap:
 		if cb == nil {
 			return nil
 		}
-		return d.peerStorage.Engines.Kv.View(
+
+		if err := d.peerStorage.Engines.Kv.View(
 			func(txn *badger.Txn) error {
 				if cb != nil {
 					cb.Txn = txn
 					cb.Resp.Responses = append(cb.Resp.Responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Snap, Snap: &raft_cmdpb.SnapResponse{Region: d.Region()}})
 				}
 				return nil
-			})
+			}); err != nil {
+			return nil
+		}
 	default:
 		return nil
 	}
+
+	return d.ctx.engine.WriteKV(kvWB)
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
