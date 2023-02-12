@@ -101,25 +101,9 @@ func (d *peerMsgHandler) applyNormalEntry(entry *eraftpb.Entry) {
 		cb = proposal.cb
 	}
 
-	// execute the cmd and callback
-	if err = d.executeKVCmd(entry, cb); err != nil {
-		log.Panic("fail to apply raft cmd")
-	}
-
-	if proposal != nil && proposal.shouldDone && d.IsLeader() {
-		proposal.cb.Done(nil) // proposal.cb.Resp is not nil
-	}
-}
-
-// applyRaftCmd apply the passing cmd to kvdb and call cb.Done if necessary
-func (d *peerMsgHandler) executeKVCmd(entry *eraftpb.Entry, cb *message.Callback) error {
-	cmd := new(raft_cmdpb.Request)
-	if err := cmd.Unmarshal(entry.Data); err != nil {
+	req := new(raft_cmdpb.RaftCmdRequest)
+	if err := req.Unmarshal(entry.Data); err != nil {
 		log.Panic("fail to unmarshal the cmdEntry")
-	}
-
-	if cb != nil && cb.Resp == nil {
-		cb.Resp = newCmdResp()
 	}
 
 	kvWB := new(engine_util.WriteBatch)
@@ -128,6 +112,46 @@ func (d *peerMsgHandler) executeKVCmd(entry *eraftpb.Entry, cb *message.Callback
 		log.Panicf("fail to persist the apply state %v", d.peerStorage.applyState)
 	}
 
+	// execute the cmd and callback
+	if len(req.Requests) != 0 {
+		if err = d.applyStorageCmds(req.Requests, kvWB, cb); err != nil {
+			log.Panic("fail to apply storage cmd")
+		}
+	} else if req.AdminRequest != nil {
+		if err = d.applyAdminCmd(req.AdminRequest, kvWB, cb); err != nil {
+			log.Panic("fail to apply admin cmd")
+		}
+	}
+
+	if err = d.ctx.engine.WriteKV(kvWB); err != nil {
+		log.Panic("fail to persist the write batch")
+	}
+
+	if proposal != nil && proposal.shouldDone && d.IsLeader() {
+		proposal.cb.Done(nil) // proposal.cb.Resp is not nil
+	}
+}
+
+// applyStorageCmds apply a batch of storage cmds in an entry to kvdb
+func (d *peerMsgHandler) applyStorageCmds(cmds []*raft_cmdpb.Request, kvWB *engine_util.WriteBatch, cb *message.Callback) error {
+	if len(cmds) == 0 {
+		return errors.Errorf("try to apply empty storage cmds")
+	}
+
+	if cb != nil && cb.Resp == nil {
+		cb.Resp = newCmdResp()
+	}
+
+	for _, cmd := range cmds {
+		if err := d.executeKVCmd(cmd, kvWB, cb); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (d *peerMsgHandler) executeKVCmd(cmd *raft_cmdpb.Request, kvWB *engine_util.WriteBatch, cb *message.Callback) error {
 	switch cmd.CmdType {
 	case raft_cmdpb.CmdType_Put:
 		kvWB.SetCF(cmd.Put.Cf, cmd.Put.Key, cmd.Put.Value)
@@ -167,13 +191,50 @@ func (d *peerMsgHandler) executeKVCmd(entry *eraftpb.Entry, cb *message.Callback
 				}
 				return nil
 			}); err != nil {
-			return nil
+			return err
 		}
 	default:
 		return nil
 	}
 
-	return d.ctx.engine.WriteKV(kvWB)
+	return nil
+}
+
+func (d *peerMsgHandler) applyAdminCmd(cmd *raft_cmdpb.AdminRequest, kvWB *engine_util.WriteBatch, cb *message.Callback) error {
+	if cmd == nil {
+		return errors.Errorf("unexpected admin request")
+	}
+
+	if cb != nil && cb.Resp == nil {
+		cb.Resp = newCmdResp()
+	}
+
+	if err := d.executeAdminCmd(cmd, kvWB, cb); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (d *peerMsgHandler) executeAdminCmd(cmd *raft_cmdpb.AdminRequest, kvWB *engine_util.WriteBatch, cb *message.Callback) error {
+	switch cmd.CmdType {
+	case raft_cmdpb.AdminCmdType_CompactLog:
+		y.Assert(d.peerStorage.applyState.TruncatedState != nil)
+
+		d.peerStorage.applyState.TruncatedState.Index = cmd.CompactLog.CompactIndex
+		d.peerStorage.applyState.TruncatedState.Term = cmd.CompactLog.CompactTerm
+		if err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState); err != nil {
+			return err
+		}
+
+		d.ScheduleCompactLog(cmd.CompactLog.CompactIndex)
+
+		return nil
+	case raft_cmdpb.AdminCmdType_InvalidAdmin:
+		fallthrough
+	default:
+		return errors.Errorf("invalid admin request")
+	}
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -252,36 +313,27 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 	// the Put operation
 	reqLen := len(msg.Requests)
 
-	// first loop just check if all the logs can be proposed
-	for ind, req := range msg.Requests {
-		// propose the log
-		// record the proposal
-		// d.peer.proposals = append(d.peer.proposals, &proposal{index: d.nextProposalIndex(), term: d.Term(), shouldDone: ind == reqLen-1, cb: cb})
-		d.peer.PushProposeCallback(d.nextProposalIndex(), d.Term(), ind == reqLen-1, cb)
-		oldIndex := d.nextProposalIndex()
-		oldTerm := d.Term()
+	// assumption: RaftCmdRequest only contains Requests or AdminRequest
+	y.Assert((msg.AdminRequest != nil && reqLen == 0) || (reqLen != 0 && msg.AdminRequest == nil))
 
-		var err error
-		data, err := req.Marshal()
-		if err != nil {
-			panic(err.Error())
-			// cb.Done(ErrResp(err))
-			// return
-		}
-		if err = d.peer.RaftGroup.Propose(data); err != nil {
-			panic(err.Error())
-			// cb.Done(ErrResp(err))
-			// return
-		}
+	d.peer.PushProposeCallback(d.nextProposalIndex(), d.Term(), true, cb)
+	oldIndex := d.nextProposalIndex()
+	oldTerm := d.Term()
 
-		newTerm, err := d.RaftGroup.Raft.RaftLog.Term(oldIndex)
-		if err != nil || d.RaftGroup.Raft.RaftLog.LastIndex() != oldIndex || newTerm != oldTerm {
-			errorString := fmt.Sprintf("index and term mismatch:[%v, %v] vs [%v, %v]", oldIndex, oldTerm, d.RaftGroup.Raft.RaftLog.FirstIndex(), newTerm)
-			panic(errorString)
-		}
+	data, err := msg.Marshal()
+	if err != nil {
+		panic(err.Error())
+	}
+	if err = d.peer.RaftGroup.Propose(data); err != nil {
+		panic(err.Error())
 	}
 
-	// todo: handle the admin requests
+	newTerm, err := d.RaftGroup.Raft.RaftLog.Term(oldIndex)
+	if err != nil || d.RaftGroup.Raft.RaftLog.LastIndex() != oldIndex || newTerm != oldTerm {
+		errorString := fmt.Sprintf("index and term mismatch:[%v, %v] vs [%v, %v]", oldIndex, oldTerm, d.RaftGroup.Raft.RaftLog.FirstIndex(), newTerm)
+		panic(errorString)
+	}
+
 }
 
 func (d *peerMsgHandler) onTick() {
