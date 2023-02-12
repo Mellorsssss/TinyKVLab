@@ -793,6 +793,28 @@ func (r *Raft) handlePropose(m pb.Message) {
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+
+	if m.Term < r.Term {
+		return
+	}
+
+	if m.Term > r.Term || (r.Lead != m.From && r.State != StateLeader) { // optimize: if the peer is follower in the term, there couldn't be another leader
+		r.becomeFollower(m.Term, m.From)
+	}
+
+	y.Assert(r.State == StateFollower)
+	r.electionElapsed = 0 // since recive AppendEntries from current leder, reset the ticker
+
+	if m.Snapshot == nil {
+		log.Errorf("%v expect a snapshot while get a nil", r.ToString())
+	}
+
+	// restore the data from the snapshot
+	r.RaftLog.pendingSnapshot = m.Snapshot
+	r.RaftLog.maybeCompact()
+
+	// todo: handle the conf change(3A)
+
 }
 
 // addNode add a new node to raft group
@@ -860,4 +882,8 @@ func (r *Raft) tryUpdateCommit() bool {
 	}
 
 	return false
+}
+
+func (r *Raft) ToString() string {
+	return fmt.Sprintf("[id: %v, term: %v, commit:%v, lead:%v]", r.id, r.Term, r.RaftLog.committed, r.Lead)
 }

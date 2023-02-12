@@ -93,6 +93,40 @@ func newLog(storage Storage) *RaftLog {
 // grow unlimitedly in memory
 func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
+
+	if l.pendingSnapshot == nil || l.pendingSnapshot.Metadata == nil {
+		log.Infof("log compaction failed due to nil snapshot metadata")
+		return
+	}
+
+	/*
+		if there is an incoming snapshot, several situations could occur:
+
+		1. snapshot's last applied index <= LastIndex.
+		Just drop all the logs(data in storage should already up-to-date)
+
+		2. snapshot's last applied index > LastIndex.
+			2.1 snapshot's last applied index < FirstIndex. Ignore it.
+			2.2 snapshot's last applied idnex >= FirstIndex. Truncate logs.
+	*/
+
+	meta := l.pendingSnapshot.Metadata
+	if l.LastIndex() <= meta.Index {
+		// logs are covered by incoming snapshot, drop entire logs
+		l.entries = l.entries[:0]
+	} else if len(l.entries) > 0 {
+		offset := meta.Index - l.entries[0].Index
+		if offset > 0 {
+			// retain all the logs following the last applied log from pending snapshot
+			l.entries = l.entries[offset+1:]
+		}
+	}
+
+	// snapshot only contains the committed entries(and should be applied)
+	l.applied = max(l.applied, meta.Index)
+	l.committed = max(l.committed, meta.Index)
+	l.stabled = max(l.stabled, meta.Index)
+	l.pendingSnapshot = nil
 }
 
 // allEntries return all the entries not compacted.
