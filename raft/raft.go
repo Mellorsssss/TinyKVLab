@@ -187,6 +187,7 @@ func newRaft(c *Config) *Raft {
 	} else {
 		peers = c.peers
 	}
+	log.Infof("the conf state from storage %v is %v", c.ID, confState)
 
 	return &Raft{
 		id:                  c.ID,
@@ -209,6 +210,30 @@ func newRaft(c *Config) *Raft {
 	}
 }
 
+func (r *Raft) sendSnap(to uint64) {
+	for {
+		if snap, err := r.RaftLog.storage.Snapshot(); err == ErrSnapshotTemporarilyUnavailable {
+			if err == ErrSnapshotTemporarilyUnavailable {
+				continue // snapshot is generating
+			} else {
+				log.Panicf("fail to generate snapshot when %v trying to send logs to %v", r.ToString(), to)
+			}
+		} else {
+			r.msgs = append(r.msgs, pb.Message{
+				MsgType:  pb.MessageType_MsgSnapshot,
+				Term:     r.Term,
+				From:     r.id,
+				To:       to,
+				Commit:   r.RaftLog.committed,
+				Snapshot: &snap,
+			})
+			r.Prs[to].Match = max(r.Prs[to].Match, snap.Metadata.GetIndex())
+			r.Prs[to].Next = max(r.Prs[to].Next, snap.Metadata.GetIndex()+1)
+			return
+		}
+	}
+}
+
 // sendAppend sends an append RPC with new entries (if any) and the
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
@@ -220,9 +245,9 @@ func (r *Raft) sendAppend(to uint64) bool {
 
 	logTerm, err := r.RaftLog.Term(r.Prs[to].Next - 1)
 	if err != nil { // log not found
-		log.Infof("%v fail to find prev log with %v", r.id, r.Prs[to].Next)
-		errorString := fmt.Sprintf("%v fail to find prev log with %v with logs %v", r.id, r.Prs[to].Next, r.RaftLog.entries)
-		panic(errorString)
+		// poll for a snapshot
+		r.sendSnap(to)
+		return true
 	}
 
 	log.Infof("%v send to %v, prevIndex: %v, pervTerm: %v", r.id, to, r.Prs[to].Next-1, logTerm)
@@ -259,8 +284,13 @@ func (r *Raft) sendHeartbeat(to uint64) {
 	}
 
 	log.Infof("leader %v send heartbeat to %v", r.id, to)
-	logTerm, _ := r.RaftLog.Term(r.Prs[to].Next - 1)
+	logTerm, err := r.RaftLog.Term(r.Prs[to].Next - 1)
 	// todo: send logic
+	if err != nil { // log not found
+		// poll for a snapshot
+		r.sendSnap(to)
+		return
+	}
 	r.msgs = append(r.msgs, pb.Message{MsgType: pb.MessageType_MsgHeartbeat, From: r.id, To: to, Term: r.Term, LogTerm: logTerm, Index: r.Prs[to].Next - 1, Commit: r.RaftLog.committed})
 }
 
@@ -388,7 +418,7 @@ func (r *Raft) stepFollower(m pb.Message) error {
 		log.Infof("%v get msg hup and begin a new election", r.id)
 
 		if len(r.votes) == 1 {
-			log.Errorf("%v get %v votes and become leader of term %v", r.id, 1, r.Term)
+			log.Infof("%v get %v votes and become leader of term %v", r.id, 1, r.Term)
 			r.becomeLeader()
 		} else {
 			// send requestvote to all the peers
@@ -415,6 +445,8 @@ func (r *Raft) stepFollower(m pb.Message) error {
 		r.handleAppendEntries(m)
 	case pb.MessageType_MsgAppendResponse:
 		return nil // ignore this
+	case pb.MessageType_MsgSnapshot:
+		r.handleSnapshot(m)
 	default:
 		log.Fatalf("%v get unknown msg %v", r.id, m)
 	}
@@ -428,7 +460,7 @@ func (r *Raft) stepCandidate(m pb.Message) error {
 		r.becomeCandidate()
 		log.Infof("%v get msg hup and begin a new election", r.id)
 		if len(r.votes) == 1 {
-			log.Errorf("%v get %v votes and become leader of term %v", r.id, 1, r.Term)
+			log.Infof("%v get %v votes and become leader of term %v", r.id, 1, r.Term)
 			r.becomeLeader()
 		} else {
 			// send requestvote to all the peers
@@ -453,7 +485,9 @@ func (r *Raft) stepCandidate(m pb.Message) error {
 	case pb.MessageType_MsgAppend:
 		r.handleAppendEntries(m)
 	case pb.MessageType_MsgAppendResponse:
-		return nil // ignore this
+		fallthrough
+	case pb.MessageType_MsgSnapshot:
+		return nil
 	default:
 		log.Fatalf("%v get unknown msg %v", r.id, m)
 	}
@@ -481,6 +515,8 @@ func (r *Raft) stepLeader(m pb.Message) error {
 		fallthrough
 	case pb.MessageType_MsgHeartbeatResponse:
 		r.handleHeartbeat(m)
+	case pb.MessageType_MsgSnapshot:
+		return nil
 	default:
 		log.Fatalf("leader %v get unknown msg", r.id)
 	}
@@ -539,7 +575,7 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 			r.electionElapsed = 0 // since grant a vote to another candiate, reset the ticker
 		}
 
-		log.Errorf("[%v,%v] grant requestvote from [%v,%v]", r.id, r.Term, m.From, m.Term)
+		log.Debugf("[%v,%v] grant requestvote from [%v,%v]", r.id, r.Term, m.From, m.Term)
 		r.msgs = append(r.msgs, pb.Message{MsgType: pb.MessageType_MsgRequestVoteResponse, From: r.id, To: m.From, Reject: false, Term: r.Term})
 
 	case pb.MessageType_MsgRequestVoteResponse:
@@ -564,7 +600,7 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 			}
 
 			if voteCnt >= minVotes {
-				log.Errorf("%v get %v votes and become leader of term %v with commit %v", r.id, voteCnt, r.Term, r.RaftLog.committed)
+				log.Infof("%v get %v votes and become leader of term %v with commit %v", r.id, voteCnt, r.Term, r.RaftLog.committed)
 				r.becomeLeader()
 			}
 		} else {
@@ -613,6 +649,12 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 			return
 		}
 
+		// tackle with the corner case:
+		// m.Entries[0] could be the truncted log, if so, we truncate the m.Entries
+		if len(m.Entries) != 0 && len(r.RaftLog.entries) != 0 && m.Entries[0].Index == r.RaftLog.entries[0].Index-1 {
+			m.Entries = m.Entries[1:]
+		}
+
 		// check log consistency and apply new logs
 		if m.Entries != nil && len(m.Entries) > 0 {
 			loglen := len(r.RaftLog.entries)
@@ -621,7 +663,6 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 				logoffset = 0
 			} else {
 				logoffset = int(m.Entries[0].Index) - int(r.RaftLog.entries[0].Index)
-				log.Infof("the logoffset is %v", logoffset)
 
 				assert(logoffset == loglen || r.RaftLog.entries[logoffset].Index == m.Entries[0].Index, "begin index should be the same")
 			}
@@ -651,12 +692,16 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 					offset := ent.Index - r.RaftLog.entries[0].Index
 					r.RaftLog.entries = append([]pb.Entry{}, r.RaftLog.entries[:offset]...)
 
-					// reset the stabled to make sure unstableEntries return the right entries
+					// reset the stabled to drop the inconsistent entries(and these log entries will be
+					// removed from storage soon)
+					var stabled uint64
 					if len(r.RaftLog.entries) > 0 {
-						r.RaftLog.stabled = min(r.RaftLog.stabled, r.RaftLog.LastIndex())
+						stabled = min(r.RaftLog.stabled, r.RaftLog.LastIndex())
 					} else {
-						r.RaftLog.stabled = r.RaftLog.FirstIndex() - 1 // all the entries are not stabled
+						stabled = r.RaftLog.FirstIndex() - 1 // all the entries are not stabled
 					}
+					log.Infof("%v change stable from %v to %v", r.id, r.RaftLog.stabled, stabled)
+					r.RaftLog.SetStabled(stabled)
 
 					for _, ent := range m.Entries[ind:] {
 						r.RaftLog.entries = append(r.RaftLog.entries, *ent)
@@ -678,7 +723,9 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		}
 
 		if m.Commit > r.RaftLog.committed {
-			r.RaftLog.committed = max(r.RaftLog.committed, min(m.Commit, lastNewIndex))
+			if r.RaftLog.UpdateCommited(min(m.Commit, lastNewIndex)) {
+				log.Infof("%v change commit to %v", r.ToString(), r.RaftLog.committed)
+			}
 		}
 
 		if r.RaftLog.committed > r.RaftLog.LastIndex() {
@@ -701,7 +748,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 				r.becomeFollower(m.Term, 0)
 			}
 			// todo: snapshot support
-			if r.Prs[m.From].Next != r.RaftLog.FirstIndex() {
+			if r.Prs[m.From].Next != r.RaftLog.FirstIndex()-1 {
 				r.Prs[m.From].Next--
 			}
 
@@ -742,7 +789,7 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 
 		// update committed
 		if m.Commit > r.RaftLog.committed {
-			r.RaftLog.committed = max(r.RaftLog.committed, min(m.Commit, m.Index))
+			r.RaftLog.UpdateCommited(min(m.Commit, m.Index))
 		}
 
 		if r.RaftLog.committed > r.RaftLog.LastIndex() {
@@ -761,7 +808,7 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 
 			if m.Term > r.Term { // degrade to Follower
 				r.becomeFollower(m.Term, 0)
-			} else if r.Prs[m.From].Next != r.RaftLog.FirstIndex() { // update the Next
+			} else if r.Prs[m.From].Next != r.RaftLog.FirstIndex()-1 { // update the Next
 				r.Prs[m.From].Next--
 			}
 		} else {
@@ -794,6 +841,7 @@ func (r *Raft) handlePropose(m pb.Message) {
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
 
+	log.Infof("%v handle the snapshot %v from %v", r.ToString(), m.Snapshot.Metadata, m.From)
 	if m.Term < r.Term {
 		return
 	}
@@ -805,13 +853,32 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 	y.Assert(r.State == StateFollower)
 	r.electionElapsed = 0 // since recive AppendEntries from current leder, reset the ticker
 
-	if m.Snapshot == nil {
+	if IsEmptySnap(m.Snapshot) {
 		log.Errorf("%v expect a snapshot while get a nil", r.ToString())
+		return
 	}
 
+	// stale snapshot, just ignore it
+	if m.Snapshot.GetMetadata().GetIndex() < r.RaftLog.LastIndex() {
+		return
+	}
+
+	r.RaftLog.TruncateEntries(m.Snapshot.GetMetadata().GetIndex())
+
 	// restore the data from the snapshot
+	confstate := m.Snapshot.Metadata.GetConfState()
+
+	if confstate != nil {
+		peers := confstate.GetNodes()
+		r.Prs = makePrs(peers)
+		r.votes = makeVotes(peers)
+		r.hasVoted = makeVotes(peers)
+	}
+
 	r.RaftLog.pendingSnapshot = m.Snapshot
-	r.RaftLog.maybeCompact()
+	r.RaftLog.UpdateApplied(m.Snapshot.GetMetadata().GetIndex())
+	r.RaftLog.UpdateCommited(m.Snapshot.GetMetadata().GetIndex())
+	r.RaftLog.UpdateStabled(m.Snapshot.GetMetadata().GetIndex())
 
 	// todo: handle the conf change(3A)
 
@@ -845,7 +912,7 @@ func (r *Raft) appendEntry(ents []*pb.Entry) {
 	}
 
 	if len(r.Prs) == 1 { // corner case: single node, just commit
-		r.RaftLog.committed = lastIndex
+		r.RaftLog.UpdateCommited(lastIndex)
 	}
 
 	r.Prs[r.id].Match = lastIndex
@@ -873,7 +940,7 @@ func (r *Raft) tryUpdateCommit() bool {
 		if term != r.Term {
 			return false
 		}
-		r.RaftLog.committed = matchs[th-1]
+		r.RaftLog.UpdateCommited(matchs[th-1])
 
 		// when advance commit index, broad cast append entries
 		// todo: when?
@@ -886,4 +953,9 @@ func (r *Raft) tryUpdateCommit() bool {
 
 func (r *Raft) ToString() string {
 	return fmt.Sprintf("[id: %v, term: %v, commit:%v, lead:%v]", r.id, r.Term, r.RaftLog.committed, r.Lead)
+}
+
+// Compact calls maybeCompact to compact the logs
+func (r *Raft) Compact() {
+	r.RaftLog.maybeCompact()
 }

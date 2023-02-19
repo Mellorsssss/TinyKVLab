@@ -428,7 +428,7 @@ func (p *peer) PushProposeCallback(index, term uint64, shouldDone bool, cb *mess
 // clear all the proposals and notify them
 func (p *peer) ClearProposals() {
 	if p.IsLeader() {
-		log.Errorf("leader [%v, %v] call the clear proposals", p.Meta.Id, p.Term())
+		log.Infof("leader [%v, %v] call the clear proposals", p.Meta.Id, p.Term())
 		return
 	}
 

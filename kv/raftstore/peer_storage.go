@@ -332,9 +332,6 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 		ps.raftState.LastTerm = lastTerm
 	}
 
-	if ps.raftState.HardState.Commit > ps.raftState.LastIndex {
-		log.Errorf("%v %v commit %v is larger than last index %v in term %v", ps.Tag, ps.region.Id, ps.raftState.HardState.Commit, ps.raftState.LastIndex, ps.raftState.HardState.Term)
-	}
 	raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
 
 	return nil
@@ -348,11 +345,103 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 		return nil, err
 	}
 
+	// only apply the snapshot that covers all of the logs
+	// if the snapshot partially covers the logs, then the gc worker will automatically
+	// truncate it(just as all other peers), so there is no need to apply the snapshot
+	//
+	// assumptions:
+	// if a snapshot only contains the old logs, then we don't need to care about the
+	// membership information it carries
+	if snapshot.GetMetadata().GetIndex() < ps.raftState.LastIndex {
+		log.Errorf("%v refuse to apply the snapshot(%v) with last index %v", ps.Tag, snapshot.GetMetadata().GetIndex(), ps.raftState.LastIndex)
+		return nil, nil
+	}
+
+	if snapshot.GetMetadata().GetIndex() < ps.truncatedIndex() {
+		log.Panicf("try to apply a stale snapshot(current lastindex: %v, incoming lastindex: %v)", ps.raftState.LastIndex, snapshot.Metadata.Index)
+	} else if snapshot.GetMetadata().GetIndex() == ps.truncatedIndex() {
+		if snapshot.GetMetadata().GetTerm() == ps.truncatedTerm() {
+			return nil, nil
+		} else {
+			log.Panicf("try to apply a wrong snapshot(current truncated index, term: (%v, %v), incoming lastindex: %v)", ps.truncatedIndex(), ps.truncatedTerm(), snapshot.Metadata.Index)
+		}
+	}
+
+	y.Assert(snapshot.Metadata.GetIndex() >= ps.raftState.LastIndex)
 	// Hint: things need to do here including: update peer storage state like raftState and applyState, etc,
 	// and send RegionTaskApply task to region worker through ps.regionSched, also remember call ps.clearMeta
 	// and ps.clearExtraData to delete stale data
 	// Your Code Here (2C).
-	return nil, nil
+
+	oldRegion := ps.region
+	newRegion := snapData.Region
+
+	applyresult := &ApplySnapResult{
+		PrevRegion: oldRegion,
+		Region:     newRegion,
+	}
+
+	max := func(a, b uint64) uint64 {
+		if a > b {
+			return a
+		} else {
+			return b
+		}
+	}
+
+	// clear the stale data first
+	// since the oldRegion and newRegion could be the same region
+	// if we clear the stale data after apply the changes from the snapshot,
+	// some changes could be dropped
+	if err := ps.clearMeta(kvWB, raftWB); err != nil {
+		return nil, err
+	}
+	ps.clearExtraData(newRegion)
+
+	if snapshot.GetMetadata().GetIndex() >= ps.raftState.LastIndex {
+		ps.raftState.HardState.Commit = max(ps.raftState.HardState.Commit, snapshot.Metadata.GetIndex())
+		ps.raftState.HardState.Term = max(ps.raftState.HardState.Term, snapshot.Metadata.GetTerm())
+
+		ps.raftState.LastIndex = snapshot.GetMetadata().GetIndex()
+		ps.raftState.LastTerm = snapshot.GetMetadata().GetTerm()
+		if err := raftWB.SetMeta(meta.RaftStateKey(newRegion.Id), ps.raftState); err != nil {
+			return nil, err
+		}
+	}
+
+	ps.applyState.AppliedIndex = max(ps.applyState.AppliedIndex, snapshot.Metadata.Index)
+	ps.applyState.TruncatedState.Index = max(ps.applyState.TruncatedState.Index, snapshot.Metadata.Index)
+	ps.applyState.TruncatedState.Term = max(ps.applyState.TruncatedState.Term, snapshot.Metadata.Term)
+
+	if err := kvWB.SetMeta(meta.ApplyStateKey(newRegion.Id), ps.applyState); err != nil {
+		return nil, err
+	}
+
+	state := new(rspb.RegionLocalState)
+	state.Region = newRegion
+
+	if err := kvWB.SetMeta(meta.RegionStateKey(newRegion.Id), state); err != nil {
+		return nil, err
+	}
+
+	ch := make(chan bool, 1)
+	ps.snapState.StateType = snap.SnapState_Applying
+	ps.regionSched <- &runner.RegionTaskApply{
+		RegionId: newRegion.GetId(),
+		Notifier: ch,
+		SnapMeta: snapshot.Metadata,
+		StartKey: oldRegion.StartKey,
+		EndKey:   oldRegion.EndKey,
+	}
+
+	succ := <-ch
+
+	if !succ {
+		return nil, errors.Errorf("fail to apply the snapshot: %v", snapData)
+	}
+
+	ps.region = newRegion
+	return applyresult, nil
 }
 
 // Save memory states to disk.
@@ -361,12 +450,21 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
 	// Your Code Here (2B/2C).
 
-	// create a writeBatch to atomically update
-	// todo: should we persist the state first and then update in-memory state?
+	// create  writeBatches to atomically update
 	raftWB := new(engine_util.WriteBatch)
+	kvWB := new(engine_util.WriteBatch)
 
 	if !raft.IsEmptyHardState(ready.HardState) {
 		*ps.raftState.HardState = ready.HardState
+	}
+
+	var applyresult *ApplySnapResult
+	if !raft.IsEmptySnap(&ready.Snapshot) {
+		var err error
+		applyresult, err = ps.ApplySnapshot(&ready.Snapshot, kvWB, raftWB)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	if err := ps.Append(ready.Entries, raftWB); err != nil {
@@ -378,10 +476,22 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 			log.Errorf("%v's commit %v is not equal to last committed entry index %v", ps.Tag, ready.CommittedEntries[len(ready.CommittedEntries)-1].Index, ps.raftState.HardState.Commit)
 		}
 	}
+
 	if err := raftWB.WriteToDB(ps.Engines.Raft); err != nil {
 		return nil, err
 	}
-	return nil, nil
+
+	if err := kvWB.WriteToDB(ps.Engines.Kv); err != nil {
+		return nil, err
+	}
+
+	log.Infof("%v current state %v with new entries %v and committed entries %v", ps.Tag, ps.raftState, ready.Entries, ready.CommittedEntries)
+
+	if ps.raftState.HardState.Commit > ps.raftState.LastIndex {
+		log.Panicf("%v %v commit %v is larger than last index %v in term %v", ps.Tag, ps.region.Id, ps.raftState.HardState.Commit, ps.raftState.LastIndex, ps.raftState.HardState.Term)
+	}
+
+	return applyresult, nil
 }
 
 // SaveApplyState persist the applyState, make sure in-memory applyState is updated

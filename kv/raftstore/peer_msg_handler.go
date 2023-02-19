@@ -58,7 +58,6 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		// send all the outbound messages
 		d.Send(d.ctx.trans, ready.Messages)
 
-		// todo: maybe we could save some proposals?
 		// remove the previous proposals since we are no more leader,
 		// in case of return a wrong RPC (safe but not efficient)
 		if !d.IsLeader() {
@@ -73,6 +72,8 @@ func (d *peerMsgHandler) HandleRaftReady() {
 				panic("not support conf change now")
 			}
 		}
+
+		d.RaftGroup.Raft.Compact()
 
 		// update the apply state and persist them
 		if len(ready.CommittedEntries) > 0 {
@@ -93,7 +94,7 @@ func (d *peerMsgHandler) applyNormalEntry(entry *eraftpb.Entry) {
 
 	proposal, err := d.GetProposeCallback(entry.Index, entry.Term)
 	if err != nil && d.IsLeader() {
-		log.Errorf("leader [%v, %v] has no proposal for [%v, %v]", d.Meta.Id, d.RaftGroup.Raft.Term, entry.Index, entry.Term)
+		log.Debugf("leader [%v, %v] has no proposal for [%v, %v]", d.Meta.Id, d.RaftGroup.Raft.Term, entry.Index, entry.Term)
 	}
 
 	var cb *message.Callback
@@ -221,8 +222,15 @@ func (d *peerMsgHandler) executeAdminCmd(cmd *raft_cmdpb.AdminRequest, kvWB *eng
 	case raft_cmdpb.AdminCmdType_CompactLog:
 		y.Assert(d.peerStorage.applyState.TruncatedState != nil)
 
-		d.peerStorage.applyState.TruncatedState.Index = cmd.CompactLog.CompactIndex
-		d.peerStorage.applyState.TruncatedState.Term = cmd.CompactLog.CompactTerm
+		max := func(a, b uint64) uint64 {
+			if a > b {
+				return a
+			} else {
+				return b
+			}
+		}
+		d.peerStorage.applyState.TruncatedState.Index = max(cmd.CompactLog.CompactIndex, d.peerStorage.applyState.TruncatedState.Index)
+		d.peerStorage.applyState.TruncatedState.Term = max(cmd.CompactLog.CompactTerm, d.peerStorage.applyState.TruncatedState.Term)
 		if err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState); err != nil {
 			return err
 		}

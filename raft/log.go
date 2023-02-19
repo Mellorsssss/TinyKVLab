@@ -67,9 +67,21 @@ func newLog(storage Storage) *RaftLog {
 
 	hardState, _, _ := storage.InitialState()
 	// corner case: filter the dummy logs
-	lo, _ := storage.FirstIndex()
-	hi, _ := storage.LastIndex()
-	ents, _ := storage.Entries(lo, hi+1)
+	lo, err := storage.FirstIndex()
+	if err != nil {
+		log.Panicf(err.Error())
+	}
+
+	hi, err := storage.LastIndex()
+	if err != nil {
+		log.Panicf(err.Error())
+	}
+
+	ents, err := storage.Entries(lo, hi+1)
+	if err != nil {
+		log.Panicf(err.Error())
+	}
+
 	var stabled uint64
 	if len(ents) > 0 {
 		stabled = ents[len(ents)-1].Index
@@ -77,14 +89,12 @@ func newLog(storage Storage) *RaftLog {
 		stabled = hi
 	}
 
-	snapshot, _ := storage.Snapshot()
 	return &RaftLog{
-		storage:         storage,
-		committed:       hardState.Commit,
-		applied:         lo - 1,  // apply from the first possible log
-		stabled:         stabled, // todo: is this wrong?
-		entries:         ents,
-		pendingSnapshot: &snapshot,
+		storage:   storage,
+		committed: hardState.Commit,
+		applied:   lo - 1,  // apply from the first possible log
+		stabled:   stabled, // todo: is this wrong?
+		entries:   ents,
 	}
 }
 
@@ -94,39 +104,19 @@ func newLog(storage Storage) *RaftLog {
 func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
 
-	if l.pendingSnapshot == nil || l.pendingSnapshot.Metadata == nil {
-		log.Infof("log compaction failed due to nil snapshot metadata")
+	truncatedIndex, err := l.storage.FirstIndex()
+	if err != nil {
+		log.Errorf("fail to get the first index")
 		return
 	}
+	truncatedIndex -= 1
 
-	/*
-		if there is an incoming snapshot, several situations could occur:
-
-		1. snapshot's last applied index <= LastIndex.
-		Just drop all the logs(data in storage should already up-to-date)
-
-		2. snapshot's last applied index > LastIndex.
-			2.1 snapshot's last applied index < FirstIndex. Ignore it.
-			2.2 snapshot's last applied idnex >= FirstIndex. Truncate logs.
-	*/
-
-	meta := l.pendingSnapshot.Metadata
-	if l.LastIndex() <= meta.Index {
-		// logs are covered by incoming snapshot, drop entire logs
-		l.entries = l.entries[:0]
-	} else if len(l.entries) > 0 {
-		offset := meta.Index - l.entries[0].Index
-		if offset > 0 {
-			// retain all the logs following the last applied log from pending snapshot
-			l.entries = l.entries[offset+1:]
-		}
-	}
+	l.TruncateEntries(truncatedIndex)
 
 	// snapshot only contains the committed entries(and should be applied)
-	l.applied = max(l.applied, meta.Index)
-	l.committed = max(l.committed, meta.Index)
-	l.stabled = max(l.stabled, meta.Index)
-	l.pendingSnapshot = nil
+	l.UpdateApplied(truncatedIndex)
+	l.UpdateCommited(truncatedIndex)
+	l.UpdateStabled(truncatedIndex)
 }
 
 // allEntries return all the entries not compacted.
@@ -175,7 +165,7 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	}
 
 	if l.applied > l.committed {
-		panic("applied should be less than committed")
+		log.Panicf("applied %v should be less than committed %v", l.applied, l.committed)
 	}
 
 	// invariant: len(l.entries) > 0
@@ -185,7 +175,6 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 
 	ents = append(ents, l.entries[appliedOffset+1:committedOffset+1]...)
 
-	log.Infof("next ents: %v", ents)
 	return ents
 }
 
@@ -193,8 +182,10 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
 	// todo: add support for snapshot
-	if len(l.entries) == 0 { // no entries, just return 0
-		if lastIndex, err := l.storage.LastIndex(); err != nil {
+	if len(l.entries) == 0 {
+		if !IsEmptySnap(l.pendingSnapshot) {
+			return l.pendingSnapshot.Metadata.Index
+		} else if lastIndex, err := l.storage.LastIndex(); err != nil {
 			panic(err.Error())
 		} else {
 			return lastIndex
@@ -210,7 +201,15 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// todo: add support for snapshot
 
 	if len(l.entries) == 0 || i < l.entries[0].Index {
-		return l.storage.Term(i)
+		if !IsEmptySnap(l.pendingSnapshot) {
+			if i == l.pendingSnapshot.Metadata.Index {
+				return l.pendingSnapshot.Metadata.Term, nil
+			} else {
+				return 0, errors.New("fail to find matching index in log")
+			}
+		} else {
+			return l.storage.Term(i)
+		}
 	}
 
 	if i > l.LastIndex() {
@@ -227,7 +226,9 @@ func (l *RaftLog) FirstIndex() uint64 {
 	// Your Code Here (2A).
 	// todo: add support for snapshot
 	if len(l.entries) == 0 { // no entries, just return 0
-		if firstIndex, err := l.storage.FirstIndex(); err != nil {
+		if !IsEmptySnap(l.pendingSnapshot) {
+			return l.pendingSnapshot.Metadata.Index + 1
+		} else if firstIndex, err := l.storage.FirstIndex(); err != nil {
 			panic(err.Error())
 		} else {
 			return firstIndex
@@ -235,4 +236,62 @@ func (l *RaftLog) FirstIndex() uint64 {
 	}
 
 	return l.entries[0].Index
+}
+
+func (l *RaftLog) UpdateCommited(committed uint64) bool {
+	if committed < l.committed {
+		return false
+	}
+	l.committed = committed
+	return true
+}
+
+func (l *RaftLog) UpdateApplied(applied uint64) bool {
+	if applied < l.applied {
+		return false
+	}
+	l.applied = applied
+	return true
+}
+
+func (l *RaftLog) UpdateStabled(stabled uint64) bool {
+	if stabled < l.stabled {
+		return false
+	}
+	l.stabled = stabled
+	return true
+}
+
+// Why is stabled able to be modified directly?
+// stabled may roll back to a smaller one due to
+// AppendEntries truncate the stable entries (previous stable entries should be dropped)
+func (l *RaftLog) SetStabled(stabled uint64) {
+	l.stabled = stabled
+}
+
+func (l *RaftLog) TruncateEntries(truncatedIndex uint64) {
+	/*
+		if there is an incoming snapshot, several situations could occur:
+
+		1. snapshot's last applied index >= LastIndex.
+		Just drop all the logs(data in storage should already up-to-date)
+
+		2. snapshot's last applied index < LastIndex.
+			2.1 snapshot's last applied index < FirstIndex. Ignore it.
+			2.2 snapshot's last applied idnex >= FirstIndex. Truncate logs.
+	*/
+	if len(l.entries) == 0 {
+		return
+	}
+
+	if l.LastIndex() <= truncatedIndex {
+		// logs are covered by incoming snapshot, drop entire logs
+		l.entries = l.entries[:0]
+		log.Infof("succed to truncate all the logs(%v -> %v)", l.FirstIndex(), truncatedIndex)
+	} else if truncatedIndex >= l.entries[0].Index {
+		offset := truncatedIndex - l.entries[0].Index
+		// retain all the logs following the last applied log from pending snapshot
+		log.Infof("succed to truncate part of the logs(%v -> %v)", l.entries[0].Index, truncatedIndex)
+		l.entries = l.entries[offset+1:]
+	}
 }

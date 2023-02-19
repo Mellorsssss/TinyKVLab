@@ -201,6 +201,11 @@ func (rn *RawNode) Ready() Ready {
 		rn.ready.HardState = curReady.HardState
 	}
 
+	if !IsEmptySnap(rn.Raft.RaftLog.pendingSnapshot) {
+		curReady.Snapshot = *rn.Raft.RaftLog.pendingSnapshot
+		rn.Raft.RaftLog.pendingSnapshot = nil // the snapshot is about to be applied, so we no more need to refer to it
+	}
+
 	return curReady
 }
 
@@ -232,6 +237,10 @@ func (rn *RawNode) HasReady() bool {
 	if len(rn.Raft.msgs) > 0 {
 		return true
 	}
+
+	if !IsEmptySnap(rn.Raft.RaftLog.pendingSnapshot) {
+		return true
+	}
 	return false
 }
 
@@ -242,7 +251,7 @@ func (rn *RawNode) Advance(rd Ready) {
 
 	if len(rd.Entries) > 0 {
 		stabled := rd.Entries[len(rd.Entries)-1].Index
-		rn.Raft.RaftLog.stabled = stabled // already stabled entries maybe truncated
+		rn.Raft.RaftLog.UpdateStabled(stabled)
 	}
 
 	if len(rd.CommittedEntries) > 0 {
@@ -251,7 +260,12 @@ func (rn *RawNode) Advance(rd Ready) {
 			panic(errorString)
 		}
 		applied := rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
-		rn.Raft.RaftLog.applied = max(rn.Raft.RaftLog.applied, applied)
+		rn.Raft.RaftLog.UpdateApplied(applied)
+	}
+
+	if !IsEmptySnap(&rd.Snapshot) {
+		rn.Raft.RaftLog.UpdateApplied(rd.Snapshot.GetMetadata().GetIndex())
+		rn.Raft.RaftLog.UpdateCommited(rd.Snapshot.GetMetadata().GetIndex())
 	}
 }
 
